@@ -1,0 +1,29 @@
+# Whisper Dictation App - Mode 1: Real-time Dictation
+# Install: pip install -r requirements.txt
+
+# Audio capture
+sounddevice>=0.4.6
+numpy>=1.24.0
+
+# Speech-to-text (CPU-optimized Whisper)
+faster-whisper>=1.0.0
+
+# Global hotkeys + keyboard simulation
+pynput>=1.7.6
+
+# Clipboard management
+pyperclip>=1.8.2
+
+# MP3 encoding (self-contained, no ffmpeg needed)
+lameenc>=1.7.0
+
+# OGG encoding (optional — requires ffmpeg on PATH)
+# pydub>=0.25.1
+
+# System Tray
+pystray>=0.19.5
+Pillow>=10.0.0
+
+# Build (optional — only needed to create .exe)
+# pyinstaller>=6.0
+# psutil  # optional, for benchmark.py RAM measurement

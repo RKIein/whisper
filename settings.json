@@ -1,0 +1,5 @@
+{
+  "model": "parakeet-ctc-110m",
+  "hotkey_mode": "toggle",
+  "sound_feedback": false
+}
