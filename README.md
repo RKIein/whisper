@@ -2,7 +2,7 @@
 
 A local, offline speech-to-text dictation tool for Windows. Lives in your system tray, stays out of your way, and types wherever your cursor is.
 
-Built because I wanted something fast and reliable that runs entirely on my CPU — no API keys, no cloud, no subscription. Just press a hotkey and talk.
+Built because I wanted something fast and reliable that runs entirely on my CPU no API cost, no cloud, no subscription.
 
 ---
 
@@ -57,11 +57,11 @@ The first time you run it, the app downloads the selected model (~150 MB for the
 | Action | How |
 |---|---|
 | Start / stop dictation | `Ctrl+Shift+Space` |
-| Cancel recording (no transcription) | `Escape` |
+| Cancel recording | `Escape` |
 | Switch model / settings | Right-click the tray icon |
 | Exit | Right-click tray → Exit |
 
-The tray icon tells you what's happening at a glance:
+The tray icon tells you what's happening:
 
 | Color | State |
 |---|---|
@@ -89,6 +89,7 @@ Switch models from the tray menu. All run locally on CPU:
 | `sensevoice-small` | sherpa-onnx | Multilingual |
 
 If you're on a mid-range laptop, `parakeet-ctc-110m` or `distil-small.en` are good starting points.
+I usually defaut to `parakeet-ctc-110m`
 
 ---
 
@@ -98,7 +99,6 @@ Edit `config.py` to tweak behaviour:
 
 ```python
 VAD_THRESHOLD = 0.5        # Raise to 0.6–0.7 if picking up background noise
-SILENCE_DURATION_S = 0.8   # Lower for snappier response after you stop speaking
 MAX_INFERENCE_THREADS = 4  # CPU threads for transcription
 ```
 
