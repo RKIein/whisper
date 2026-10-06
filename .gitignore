@@ -9,3 +9,5 @@ build/
 *.spec
 Output/
 .claude/
+calendar.ics
+calendar.ics.tmp

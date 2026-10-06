@@ -38,6 +38,13 @@ HIDDEN_IMPORTS = [
     "numpy",
     "torch",
     "torchaudio",
+    # Lecture mode — helper windows are re-launched as "<exe> --<tool>"
+    "lecture",
+    "lecture_dialog",
+    "library",
+    "calendar_setup",
+    "tkinter.filedialog",
+    "lameenc",
 ]
 
 # Data files to include (source, dest_in_bundle)
