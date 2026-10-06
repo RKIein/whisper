@@ -50,6 +50,8 @@ pip install -r requirements.txt
 python app.py
 ```
 
+**Updating:** double-click `Update.bat`. It stops the app, pulls the latest version, installs any new dependencies and starts it again. Your settings and lectures are kept.
+
 The first time you run it, the app downloads the selected model (~150 MB for the default). This happens once and then it's cached.
 
 ---
