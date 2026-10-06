@@ -58,6 +58,7 @@ LECTURE_HALLUCINATION_PATTERNS = [
     r"(?i)untertitel (im auftrag|der amara|von|by)",
     r"(?i)amara\.org",
     r"(?i)^vielen dank f(ü|ue)r'?s? (zuschauen|zuhören)",
+    r"(?i)^thank you( very much| so much)?[.!]?$",   # Whisper's filler for silence
 ]
 LECTURE_HALLUCINATION_RE = [re.compile(p) for p in LECTURE_HALLUCINATION_PATTERNS]
 
@@ -88,7 +89,9 @@ def clean_segment(text: str) -> str:
         if pattern.search(text):
             logger.debug(f"Filtered hallucination: '{text}'")
             return ""
-    text = re.sub(r'\b(\w+(?:\s+\w+)?)\s+(?:\1\s*){2,}', r'\1 ', text)
+    text = re.sub(r'(?i)\b(\w+(?:\s+\w+)?)(?:[\s,]+\1\b){2,}', r'\1', text)
+    # Repetition loops: "Das ist so. Das ist so. Das ist so." → once
+    text = re.sub(r'(?:^|(?<=[.!?…]\s))([^.!?…]{1,60}[.!?…])(?:\s*\1){2,}', r'\1', text)
     return re.sub(r'\s{2,}', ' ', text).strip()
 
 
@@ -131,8 +134,9 @@ MODEL_REGISTRY = {
     },
     "large-v3-turbo": {
         "backend": "whisper",
-        "model_path": "large-v3-turbo",
+        "model_path": "deepdml/faster-whisper-large-v3-turbo-ct2",
         "multilingual": True,
+        "lecture_beam_size": 1,   # greedy: as accurate here and 2–3× faster on CPU
     },
     # Moonshine (ONNX)
     "moonshine-tiny": {
@@ -194,7 +198,8 @@ def _get_sherpa_model_dir(repo: str) -> str:
 class _WhisperBackend:
     """faster-whisper / CTranslate2 backend."""
 
-    def __init__(self, model_path: str, on_progress=None, multilingual: bool = False):
+    def __init__(self, model_path: str, on_progress=None, multilingual: bool = False,
+                 lecture_beam_size: int | None = None):
         from faster_whisper import WhisperModel
 
         if on_progress:
@@ -202,10 +207,12 @@ class _WhisperBackend:
 
         start = time.time()
         self.multilingual = multilingual
+        self.lecture_beam_size = lecture_beam_size or config.LECTURE_BEAM_SIZE
         self.model = WhisperModel(
             model_path,
             device=config.WHISPER_DEVICE,
             compute_type=config.WHISPER_COMPUTE_TYPE,
+            cpu_threads=config.MAX_INFERENCE_THREADS,
         )
         logger.info(f"Whisper loaded: {model_path} ({time.time() - start:.1f}s)")
 
@@ -221,14 +228,16 @@ class _WhisperBackend:
         )
         return " ".join(seg.text.strip() for seg in segments).strip()
 
-    def transcribe_segments(self, audio: np.ndarray, language: str | None = None):
+    def transcribe_segments(self, audio: np.ndarray, language: str | None = None,
+                            prompt: str | None = None):
         """Long-form transcription with timestamps → ([(start, end, text)], language)."""
         if not self.multilingual:
             language = config.WHISPER_LANGUAGE
         segments, info = self.model.transcribe(
             audio,
             language=language,
-            beam_size=config.LECTURE_BEAM_SIZE,
+            initial_prompt=prompt or None,      # course name → subject vocabulary
+            beam_size=self.lecture_beam_size,
             condition_on_previous_text=False,   # avoids repetition loops on long audio
             vad_filter=True,
             without_timestamps=False,
@@ -481,7 +490,8 @@ class Transcriber:
 
         if backend_type == "whisper":
             self._backend = _WhisperBackend(
-                info["model_path"], on_progress, multilingual=info.get("multilingual", False)
+                info["model_path"], on_progress, multilingual=info.get("multilingual", False),
+                lecture_beam_size=info.get("lecture_beam_size"),
             )
         elif backend_type == "moonshine":
             self._backend = _MoonshineBackend(info["model_path"], on_progress)
@@ -514,11 +524,13 @@ class Transcriber:
 
         return text
 
-    def transcribe_segments(self, audio: np.ndarray, language: str | None = None):
+    def transcribe_segments(self, audio: np.ndarray, language: str | None = None,
+                            prompt: str | None = None):
         """
         Transcribe a long chunk with segment timestamps (lecture mode).
 
         language: "de", "en", … or None/"auto" to auto-detect.
+        prompt: context such as the course name, to help with subject terms.
         Returns ([(start_s, end_s, text)], detected_language).
         """
         if self._backend is None:
@@ -532,7 +544,7 @@ class Transcriber:
             language = None
 
         start = time.time()
-        segments, detected = self._backend.transcribe_segments(audio, language)
+        segments, detected = self._backend.transcribe_segments(audio, language, prompt)
         cleaned = []
         for s, e, text in segments:
             text = clean_segment(text) if config.CLEAN_HALLUCINATIONS else text.strip()
