@@ -306,7 +306,10 @@ class CardList(ScrollArea):
         if not items and empty_text:
             tk.Label(self.inner, text=empty_text, font=(FONT, 10), fg=FG_DIM, bg=self["bg"],
                      justify=tk.CENTER, pady=40, wraplength=260).pack(fill=tk.X)
-        for i, item in enumerate(items):
+        self.add_items(items)
+
+    def add_items(self, items):
+        for i, item in enumerate(items, start=len(self.cards)):
             card = tk.Frame(self.inner, bg=self._card_bg, padx=self._padx, pady=self._pady,
                             cursor="hand2")
             card.pack(fill=tk.X, padx=(0, 4), pady=(0, self._gap))
