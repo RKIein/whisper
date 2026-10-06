@@ -5,6 +5,7 @@ inputs, grey text links and the pill scrollbar.
 """
 
 import os
+import sys
 import tkinter as tk
 
 from history import (  # noqa: F401  (re-exported for the windows)
@@ -28,9 +29,37 @@ HIGHLIGHT = "#fff3a3"
 
 _ICON = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets", "icon.ico")
 
+SCALE = 1.0     # display scaling (1.25 at 125 %), set when the first window opens
+
+
+def _dpi_aware():
+    """
+    Draw at the screen's real resolution. Without this, Windows renders the
+    window at 100 % and stretches the bitmap, which makes text blurry on
+    laptops set to 125 % or 150 %.
+    """
+    if sys.platform != "win32":
+        return
+    import ctypes
+    try:
+        ctypes.windll.shcore.SetProcessDpiAwareness(1)   # system DPI aware
+    except Exception:
+        try:
+            ctypes.windll.user32.SetProcessDPIAware()
+        except Exception:
+            pass
+
+
+def px(n: float) -> int:
+    """Pixels at 100 % → pixels on this screen (fonts scale by themselves)."""
+    return int(round(n * SCALE))
+
 
 def window(title: str, resizable: bool = False) -> tk.Tk:
+    global SCALE
+    _dpi_aware()
     win = tk.Tk()
+    SCALE = max(1.0, win.winfo_fpixels("1i") / 96)
     win.title(title)
     win.configure(bg=BG)
     win.resizable(resizable, resizable)
@@ -99,7 +128,7 @@ class Button(tk.Label):
     def __init__(self, parent, text: str, command, kind: str = "primary"):
         bg, hover, fg = self._COLORS[kind]
         super().__init__(parent, text=text, font=(FONT, 10), fg=fg, bg=bg,
-                         padx=16, pady=6, cursor="hand2")
+                         padx=px(16), pady=px(6), cursor="hand2")
         self.bind("<Button-1>", lambda e: command())
         self.bind("<Enter>", lambda e: self.config(bg=hover))
         self.bind("<Leave>", lambda e: self.config(bg=bg))
@@ -137,7 +166,7 @@ class Field(tk.Frame):
         self.entry = tk.Entry(self, textvariable=textvariable, font=(FONT, size), width=width,
                               bg=BG_ENTRY, fg=FG, insertbackground=FG, relief=tk.FLAT,
                               bd=0, highlightthickness=0)
-        self.entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=10, pady=6)
+        self.entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=px(10), pady=px(6))
         self.entry.bind("<FocusIn>", lambda e: self.config(highlightbackground=ACCENT), add="+")
         self.entry.bind("<FocusOut>", lambda e: self.config(highlightbackground=BORDER), add="+")
 
@@ -150,7 +179,7 @@ class ComboField(Field):
         self._var, self._on_pick = textvariable, on_pick
         self.values = list(values)
         arrow = tk.Label(self, text="▾", font=(FONT, 11), fg=FG_DIM, bg=BG_ENTRY,
-                         padx=10, cursor="hand2")
+                         padx=px(10), cursor="hand2")
         arrow.pack(side=tk.RIGHT, fill=tk.Y)
         arrow.bind("<Button-1>", lambda e: self._popup())
         arrow.bind("<Enter>", lambda e: arrow.config(fg=LINK_HOVER))
@@ -186,7 +215,7 @@ class Segmented(tk.Frame):
         self._var = variable
         self._items = {}
         for text in labels:
-            item = tk.Label(self, text=text, font=(FONT, 10), padx=14, pady=5, cursor="hand2")
+            item = tk.Label(self, text=text, font=(FONT, 10), padx=px(14), pady=px(5), cursor="hand2")
             item.pack(side=tk.LEFT)
             item.bind("<Button-1>", lambda e, t=text: self._var.set(t))
             item.bind("<Enter>", lambda e, t=text: self._hover(t, True))
@@ -288,13 +317,15 @@ class CardList(ScrollArea):
     """
     Clickable cards with one selected. Up/Down move the selection.
     build(frame, item) fills a card; on_select(index) runs on selection.
+    selectable(item) → False makes a row a plain heading (not clickable).
     """
 
     def __init__(self, parent, build, on_select, card_bg: str = BG_ENTRY,
-                 bg: str = BG, padx: int = 14, pady: int = 9, gap: int = 2):
+                 bg: str = BG, padx: int = 14, pady: int = 9, gap: int = 2, selectable=None):
         super().__init__(parent, bg=bg)
-        self._build, self._on_select = build, on_select
-        self._card_bg, self._padx, self._pady, self._gap = card_bg, padx, pady, gap
+        self._build, self._on_select, self._selectable = build, on_select, selectable
+        self._card_bg, self._padx, self._pady, self._gap = card_bg, px(padx), px(pady), px(gap)
+        self._headings: set[int] = set()
         self.cards: list[tk.Frame] = []
         self.selected: int | None = None
         self.canvas.bind("<Up>", lambda e: self._step(-1))
@@ -302,14 +333,22 @@ class CardList(ScrollArea):
 
     def set_items(self, items, empty_text: str = ""):
         self.clear()
-        self.cards, self.selected = [], None
+        self.cards, self.selected, self._headings = [], None, set()
         if not items and empty_text:
             tk.Label(self.inner, text=empty_text, font=(FONT, 10), fg=FG_DIM, bg=self["bg"],
-                     justify=tk.CENTER, pady=40, wraplength=260).pack(fill=tk.X)
+                     justify=tk.CENTER, pady=px(40), wraplength=px(260)).pack(fill=tk.X)
         self.add_items(items)
 
     def add_items(self, items):
         for i, item in enumerate(items, start=len(self.cards)):
+            if self._selectable and not self._selectable(item):
+                heading = tk.Frame(self.inner, bg=self["bg"])
+                heading.pack(fill=tk.X, padx=(0, px(4)))
+                self._build(heading, item)
+                set_bg(heading, self["bg"])
+                self._headings.add(i)
+                self.cards.append(heading)
+                continue
             card = tk.Frame(self.inner, bg=self._card_bg, padx=self._padx, pady=self._pady,
                             cursor="hand2")
             card.pack(fill=tk.X, padx=(0, 4), pady=(0, self._gap))
@@ -322,7 +361,7 @@ class CardList(ScrollArea):
             self.cards.append(card)
 
     def select(self, i: int, focus: bool = False, notify: bool = True):
-        if not (0 <= i < len(self.cards)):
+        if not (0 <= i < len(self.cards)) or i in self._headings:
             return
         previous, self.selected = self.selected, i
         if previous is not None and previous < len(self.cards):
@@ -334,10 +373,17 @@ class CardList(ScrollArea):
         if notify:
             self._on_select(i)
 
+    def first(self) -> int | None:
+        """Index of the first selectable row."""
+        return next((i for i in range(len(self.cards)) if i not in self._headings), None)
+
     def _step(self, delta: int):
-        if self.cards:
-            self.select(0 if self.selected is None else
-                        max(0, min(len(self.cards) - 1, self.selected + delta)))
+        i = self.selected if self.selected is not None else -delta
+        while 0 <= i + delta < len(self.cards):
+            i += delta
+            if i not in self._headings:
+                self.select(i)
+                return
 
     def _inside(self, event, i: int) -> bool:
         """Leave also fires when the pointer moves onto a label inside the card."""

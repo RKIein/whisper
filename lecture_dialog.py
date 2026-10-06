@@ -42,38 +42,38 @@ class LectureDialog:
         self.event = cal.current() if cal.available else None
 
         self.win = ui.window("Start lecture")
-        self.win.configure(padx=24, pady=20)
+        self.win.configure(padx=ui.px(24), pady=ui.px(20))
         self.win.attributes("-topmost", True)
         self.win.columnconfigure(0, weight=1)
 
-        ui.heading(self.win, "Start lecture").grid(row=0, column=0, sticky="w", pady=(0, 14))
+        ui.heading(self.win, "Start lecture").grid(row=0, column=0, sticky="w", pady=(0, ui.px(14)))
         row = 1
 
         self.use_cal = tk.BooleanVar(value=self.event is not None)
         if self.event:
             ev = self.event
             box = tk.Frame(self.win, bg=ui.BG_ENTRY)
-            box.grid(row=row, column=0, sticky="ew", pady=(0, 16))
+            box.grid(row=row, column=0, sticky="ew", pady=(0, ui.px(16)))
             tk.Frame(box, bg=ui.ACCENT, width=3).pack(side=tk.LEFT, fill=tk.Y)
-            body = tk.Frame(box, bg=ui.BG_ENTRY, padx=14, pady=10)
+            body = tk.Frame(box, bg=ui.BG_ENTRY, padx=ui.px(14), pady=ui.px(10))
             body.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
             meta = "  ·  ".join(x for x in ("Now on your timetable",f"{ev.start:%H:%M}–{ev.end:%H:%M}",
                                             ev.kind) if x)
             tk.Label(body, text=meta, font=(ui.FONT, 9), fg=ui.ACCENT, bg=ui.BG_ENTRY,
                      anchor="w").pack(fill=tk.X)
             tk.Label(body, text=ev.course, font=(ui.FONT, 10, "bold"), fg=ui.FG, bg=ui.BG_ENTRY,
-                     anchor="w", wraplength=400, justify=tk.LEFT).pack(fill=tk.X, pady=(2, 0))
+                     anchor="w", wraplength=ui.px(400), justify=tk.LEFT).pack(fill=tk.X, pady=(ui.px(2), 0))
             details = "  ·  ".join(x for x in (ev.room, ev.lecturer) if x)
             if details:
                 tk.Label(body, text=details, font=(ui.FONT, 9), fg=ui.FG_DIM, bg=ui.BG_ENTRY,
-                         anchor="w", wraplength=400, justify=tk.LEFT).pack(fill=tk.X)
+                         anchor="w", wraplength=ui.px(400), justify=tk.LEFT).pack(fill=tk.X)
             ui.Check(body, "Fill in from timetable", self.use_cal, command=self._apply_defaults,
-                     bg=ui.BG_ENTRY).pack(anchor="w", pady=(6, 0))
+                     bg=ui.BG_ENTRY).pack(anchor="w", pady=(ui.px(6), 0))
             row += 1
 
         def label(text):
             nonlocal row
-            ui.caption(self.win, text).grid(row=row, column=0, sticky="w", pady=(0, 3))
+            ui.caption(self.win, text).grid(row=row, column=0, sticky="w", pady=(0, ui.px(3)))
             row += 1
 
         label("Course")
@@ -83,14 +83,14 @@ class LectureDialog:
         self.course_var = tk.StringVar()
         self.course_box = ui.ComboField(self.win, self.course_var, values=course_names,
                                         on_pick=self._on_course_change, width=48)
-        self.course_box.grid(row=row, column=0, sticky="ew", pady=(0, 12))
+        self.course_box.grid(row=row, column=0, sticky="ew", pady=(0, ui.px(12)))
         self.course_box.entry.bind("<FocusOut>", lambda e: self._on_course_change(), add="+")
         row += 1
 
         label("Title")
         self.title_var = tk.StringVar()
         title = ui.Field(self.win, self.title_var, width=48)
-        title.grid(row=row, column=0, sticky="ew", pady=(0, 12))
+        title.grid(row=row, column=0, sticky="ew", pady=(0, ui.px(12)))
         self.title_entry = title.entry
         self.title_entry.bind("<Key>", lambda e: setattr(self, "_title_edited", True))
         row += 1
@@ -102,9 +102,9 @@ class LectureDialog:
         row += 1
 
         buttons = tk.Frame(self.win, bg=ui.BG)
-        buttons.grid(row=row, column=0, sticky="e", pady=(22, 0))
+        buttons.grid(row=row, column=0, sticky="e", pady=(ui.px(22), 0))
         ui.Button(buttons, "●  Start recording", self._start, kind="record").pack(side=tk.RIGHT)
-        ui.Link(buttons, "Cancel", self._cancel, size=10).pack(side=tk.RIGHT, padx=(0, 18))
+        ui.Link(buttons, "Cancel", self._cancel, size=10).pack(side=tk.RIGHT, padx=(0, ui.px(18)))
 
         self.win.bind("<Return>", lambda e: self._start())
         self.win.bind("<Escape>", lambda e: self._cancel())
