@@ -52,6 +52,21 @@ Start/stop voice recording from the tray menu. Recordings are saved to
 
 MP3 works out of the box. OGG requires ffmpeg on PATH.
 
+## Lecture Mode
+
+Tray → **Start lecture…** records a whole lecture/seminar and transcribes it
+live in ~60 s chunks with a multilingual Whisper model (German/English).
+Lectures are saved to `~/Documents/Lectures/<Course>/<date – title>/`
+(audio.mp3, transcript.md, transcript.srt, lecture.json).
+
+- `Ctrl+Shift+B` — bookmark while recording
+- Tray → Lecture library — browse, search, play, re-transcribe
+- Tray → Lecture settings → Calendar / timetable… — import your .ics
+  (e.g. TraiNex Studienplan) so course, type, room and lecturer are filled in
+- Tray → Lecture settings → Model — small (default), medium, large-v3-turbo
+
+Run the tests with `pip install pytest` and `python -m pytest tests`.
+
 ## Available Models
 
 Switch models from the tray menu. Available backends:

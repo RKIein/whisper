@@ -34,6 +34,9 @@ STATE_LISTENING = "listening"
 STATE_TRANSCRIBING = "transcribing"
 STATE_RECORDING = "recording"
 STATE_SAVING = "saving"
+STATE_LECTURE = "lecture"
+STATE_LECTURE_PAUSED = "lecture_paused"
+STATE_LECTURE_FINISHING = "lecture_finishing"
 
 STATE_COLORS = {
     STATE_IDLE:          "#5a5a5a",   # Gray — nothing happening
@@ -42,6 +45,9 @@ STATE_COLORS = {
     STATE_TRANSCRIBING:  "#e8963a",   # Amber — processing audio
     STATE_RECORDING:     "#5a5a5a",   # Gray — silent background recording
     STATE_SAVING:        "#5a5a5a",   # Gray — saving file
+    STATE_LECTURE:           "#d9443a",   # Red — lecture recording
+    STATE_LECTURE_PAUSED:    "#9e9e9e",   # Light gray — lecture paused
+    STATE_LECTURE_FINISHING: "#e8963a",   # Amber — finishing lecture transcript
 }
 
 STATE_TITLES = {
@@ -51,6 +57,9 @@ STATE_TITLES = {
     STATE_TRANSCRIBING:  "Whisper Dictation — Transcribing…",
     STATE_RECORDING:     "Whisper Dictation — Recording…",
     STATE_SAVING:        "Whisper Dictation — Saving recording…",
+    STATE_LECTURE:           "Lecture — recording…",
+    STATE_LECTURE_PAUSED:    "Lecture — paused",
+    STATE_LECTURE_FINISHING: "Lecture — finishing transcript…",
 }
 
 
@@ -84,7 +93,7 @@ def _create_icon_image(state: str = STATE_IDLE) -> Image.Image:
     draw.line([cx - 8, stand_top + 8, cx + 8, stand_top + 8], fill=color, width=3)
 
     # Recording indicator: small red dot in top-right corner when listening (dictation only)
-    if state == STATE_LISTENING:
+    if state in (STATE_LISTENING, STATE_LECTURE):
         dot_r = 6
         draw.ellipse(
             [ICON_SIZE - dot_r * 2 - 2, 2, ICON_SIZE - 2, dot_r * 2 + 2],
@@ -135,6 +144,18 @@ class TrayIcon:
         self.on_sound_toggle = None
         self.on_recording_toggle = None
         self.on_recording_format_change = None
+        # Lecture mode
+        self.on_lecture_start = None          # () → open start dialog
+        self.on_lecture_quick_start = None    # () → start with calendar/last course
+        self.on_lecture_pause_toggle = None
+        self.on_lecture_bookmark = None
+        self.on_lecture_stop = None
+        self.on_lecture_model_change = None   # (model_id)
+        self.on_lecture_library = None
+        self.on_calendar_setup = None
+        self.lecture_root = ""
+        self.quick_start_label = None         # callable → str | None
+        self._lecture_model = "small"
         self._state = STATE_IDLE
         self._current_model = "base.en"
         self._hotkey_mode = "toggle"
@@ -196,6 +217,32 @@ class TrayIcon:
     def set_recording_format(self, fmt: str):
         self._recording_format = fmt
 
+    def set_lecture_model(self, model_id: str):
+        self._lecture_model = model_id
+
+    def refresh_menu(self):
+        try:
+            if self._icon is not None:
+                self._icon.update_menu()
+        except Exception:
+            pass
+
+    @property
+    def _lecture_running(self) -> bool:
+        return self._state in (STATE_LECTURE, STATE_LECTURE_PAUSED)
+
+    @property
+    def _lecture_idle(self) -> bool:
+        return self._state not in (STATE_LECTURE, STATE_LECTURE_PAUSED,
+                                   STATE_LECTURE_FINISHING, STATE_LISTENING,
+                                   STATE_TRANSCRIBING, STATE_RECORDING, STATE_LOADING)
+
+    def _quick_label(self) -> str | None:
+        try:
+            return self.quick_start_label() if self.quick_start_label else None
+        except Exception:
+            return None
+
     def _build_icon(self) -> pystray.Icon:
         menu = pystray.Menu(
             # Hidden default item — LEFT-CLICK stops recording
@@ -210,6 +257,61 @@ class TrayIcon:
                 "Stop dictation",
                 self._on_stop,
                 enabled=lambda _: self._state == STATE_LISTENING,
+            ),
+            pystray.Menu.SEPARATOR,
+            # ── Lecture mode ──
+            pystray.MenuItem(
+                lambda _: f"● Record now: {self._quick_label()}",
+                lambda icon, item: self._call(self.on_lecture_quick_start),
+                visible=lambda _: self._lecture_idle and bool(self._quick_label()),
+            ),
+            pystray.MenuItem(
+                "Start lecture…",
+                lambda icon, item: self._call(self.on_lecture_start),
+                visible=lambda _: not self._lecture_running and self._state != STATE_LECTURE_FINISHING,
+                enabled=lambda _: self._lecture_idle,
+            ),
+            pystray.MenuItem(
+                lambda _: "Resume lecture" if self._state == STATE_LECTURE_PAUSED else "Pause lecture",
+                lambda icon, item: self._call(self.on_lecture_pause_toggle),
+                visible=lambda _: self._lecture_running,
+            ),
+            pystray.MenuItem(
+                "Add bookmark  (Ctrl+Shift+B)",
+                lambda icon, item: self._call(self.on_lecture_bookmark),
+                visible=lambda _: self._lecture_running,
+            ),
+            pystray.MenuItem(
+                "■ Stop lecture",
+                lambda icon, item: self._call(self.on_lecture_stop),
+                visible=lambda _: self._lecture_running,
+            ),
+            pystray.MenuItem(
+                "Finishing transcript…",
+                lambda icon, item: None,
+                enabled=False,
+                visible=lambda _: self._state == STATE_LECTURE_FINISHING,
+            ),
+            pystray.MenuItem(
+                "Lecture library",
+                lambda icon, item: self._call(self.on_lecture_library),
+            ),
+            pystray.MenuItem(
+                "Lecture settings",
+                pystray.Menu(
+                    pystray.MenuItem(
+                        "Model",
+                        pystray.Menu(*self._build_lecture_model_menu()),
+                    ),
+                    pystray.MenuItem(
+                        "Calendar / timetable…",
+                        lambda icon, item: self._call(self.on_calendar_setup),
+                    ),
+                    pystray.MenuItem(
+                        "Open lectures folder",
+                        self._on_open_lectures,
+                    ),
+                ),
             ),
             pystray.Menu.SEPARATOR,
             pystray.MenuItem(
@@ -321,6 +423,41 @@ class TrayIcon:
                 checked=_make_checked,
             ))
         return items
+
+    def _build_lecture_model_menu(self):
+        items = []
+        for mid, info in config.LECTURE_MODELS.items():
+            def _make_checked(_, mid=mid):
+                return self._lecture_model == mid
+
+            def _make_action(mid=mid):
+                def _action(icon, item):
+                    if mid != self._lecture_model:
+                        self._lecture_model = mid
+                        self._call(self.on_lecture_model_change, mid)
+                return _action
+
+            items.append(pystray.MenuItem(
+                f"{info['label']}  ({info['size']})",
+                _make_action(mid),
+                checked=_make_checked,
+                radio=True,
+            ))
+        return items
+
+    def _call(self, callback, *args):
+        if callback:
+            try:
+                callback(*args)
+            except Exception as e:
+                logger.error(f"Menu action failed: {e}")
+
+    def _on_open_lectures(self, icon, item):
+        try:
+            os.makedirs(self.lecture_root, exist_ok=True)
+            os.startfile(self.lecture_root)
+        except Exception as e:
+            logger.error(f"Could not open lectures folder: {e}")
 
     def _on_format_select(self, fmt: str):
         if fmt == self._recording_format:

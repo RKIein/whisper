@@ -39,9 +39,27 @@ HALLUCINATION_PATTERNS = [
     r"(?i)^copyright",
     r"(?i)^music$",
     r"(?i)^\[.*\]$",
+    # Classic German Whisper hallucinations on silence / applause
+    r"(?i)untertitel (im auftrag|der amara|von|by)",
+    r"(?i)amara\.org",
+    r"(?i)^vielen dank f(ü|ue)r'?s? (zuschauen|zuhören)",
+    r"(?i)^(tschüss|danke)[\.!\s]*$",
 ]
 
 HALLUCINATION_RE = [re.compile(p) for p in HALLUCINATION_PATTERNS]
+
+# For lectures only drop whole-segment junk — a lecturer may well say
+# "copyright" or "see you next week", which dictation filters out.
+LECTURE_HALLUCINATION_PATTERNS = [
+    r"^[\s.,!?\-;:]+$",
+    r"(?i)^(you|music|\[.*\]|\(.*\)|\*.*\*)$",
+    r"(?i)thanks for watching",
+    r"(?i)^(please )?(like and )?subscribe",
+    r"(?i)untertitel (im auftrag|der amara|von|by)",
+    r"(?i)amara\.org",
+    r"(?i)^vielen dank f(ü|ue)r'?s? (zuschauen|zuhören)",
+]
+LECTURE_HALLUCINATION_RE = [re.compile(p) for p in LECTURE_HALLUCINATION_PATTERNS]
 
 
 def clean_transcription(text: str) -> str:
@@ -59,6 +77,19 @@ def clean_transcription(text: str) -> str:
     if len(text.strip()) < 2:
         return ""
     return text.strip()
+
+
+def clean_segment(text: str) -> str:
+    """Lighter clean-up for long-form (lecture) segments — keeps punctuation."""
+    if not text:
+        return ""
+    text = text.strip()
+    for pattern in LECTURE_HALLUCINATION_RE:
+        if pattern.search(text):
+            logger.debug(f"Filtered hallucination: '{text}'")
+            return ""
+    text = re.sub(r'\b(\w+(?:\s+\w+)?)\s+(?:\1\s*){2,}', r'\1 ', text)
+    return re.sub(r'\s{2,}', ' ', text).strip()
 
 
 # ─── Model registry ─────────────────────────────────────────
@@ -86,6 +117,22 @@ MODEL_REGISTRY = {
     "distil-medium.en": {
         "backend": "whisper",
         "model_path": "Systran/faster-distil-whisper-medium.en",
+    },
+    # Multilingual Whisper (German, English, …) — used by lecture mode
+    "small": {
+        "backend": "whisper",
+        "model_path": "small",
+        "multilingual": True,
+    },
+    "medium": {
+        "backend": "whisper",
+        "model_path": "medium",
+        "multilingual": True,
+    },
+    "large-v3-turbo": {
+        "backend": "whisper",
+        "model_path": "large-v3-turbo",
+        "multilingual": True,
     },
     # Moonshine (ONNX)
     "moonshine-tiny": {
@@ -137,13 +184,14 @@ def _get_sherpa_model_dir(repo: str) -> str:
 class _WhisperBackend:
     """faster-whisper / CTranslate2 backend."""
 
-    def __init__(self, model_path: str, on_progress=None):
+    def __init__(self, model_path: str, on_progress=None, multilingual: bool = False):
         from faster_whisper import WhisperModel
 
         if on_progress:
             on_progress(f"Loading {model_path}…")
 
         start = time.time()
+        self.multilingual = multilingual
         self.model = WhisperModel(
             model_path,
             device=config.WHISPER_DEVICE,
@@ -154,7 +202,7 @@ class _WhisperBackend:
     def transcribe(self, audio: np.ndarray) -> str:
         segments, info = self.model.transcribe(
             audio,
-            language=config.WHISPER_LANGUAGE,
+            language=None if self.multilingual else config.WHISPER_LANGUAGE,
             beam_size=config.WHISPER_BEAM_SIZE_FINAL,
             temperature=config.WHISPER_TEMPERATURE,
             condition_on_previous_text=config.WHISPER_CONDITION_ON_PREVIOUS,
@@ -162,6 +210,21 @@ class _WhisperBackend:
             without_timestamps=True,
         )
         return " ".join(seg.text.strip() for seg in segments).strip()
+
+    def transcribe_segments(self, audio: np.ndarray, language: str | None = None):
+        """Long-form transcription with timestamps → ([(start, end, text)], language)."""
+        if not self.multilingual:
+            language = config.WHISPER_LANGUAGE
+        segments, info = self.model.transcribe(
+            audio,
+            language=language,
+            beam_size=config.LECTURE_BEAM_SIZE,
+            condition_on_previous_text=False,   # avoids repetition loops on long audio
+            vad_filter=True,
+            without_timestamps=False,
+        )
+        out = [(seg.start, seg.end, seg.text) for seg in segments]
+        return out, info.language
 
 
 class _MoonshineBackend:
@@ -281,9 +344,9 @@ class Transcriber:
     Supports Whisper, Distil-Whisper, Moonshine, Parakeet, and SenseVoice.
     """
 
-    def __init__(self):
+    def __init__(self, model_id: str | None = None):
         self._backend = None
-        self._model_id: str = config.WHISPER_MODEL_FINAL
+        self._model_id: str = model_id or config.WHISPER_MODEL_FINAL
         self._loaded = False
         self._load_lock = threading.Lock()
 
@@ -322,7 +385,9 @@ class Transcriber:
         backend_type = info["backend"]
 
         if backend_type == "whisper":
-            self._backend = _WhisperBackend(info["model_path"], on_progress)
+            self._backend = _WhisperBackend(
+                info["model_path"], on_progress, multilingual=info.get("multilingual", False)
+            )
         elif backend_type == "moonshine":
             self._backend = _MoonshineBackend(info["model_path"], on_progress)
         elif backend_type == "sherpa-nemo-ctc":
@@ -351,3 +416,33 @@ class Transcriber:
             )
 
         return text
+
+    def transcribe_segments(self, audio: np.ndarray, language: str | None = None):
+        """
+        Transcribe a long chunk with segment timestamps (lecture mode).
+
+        language: "de", "en", … or None/"auto" to auto-detect.
+        Returns ([(start_s, end_s, text)], detected_language).
+        """
+        if self._backend is None:
+            raise RuntimeError("Transcriber not loaded.")
+        if not hasattr(self._backend, "transcribe_segments"):
+            raise RuntimeError(
+                f"Model '{self._model_id}' can't do timestamped transcription — "
+                "choose a Whisper model for lecture mode."
+            )
+        if language in (None, "", "auto"):
+            language = None
+
+        start = time.time()
+        segments, detected = self._backend.transcribe_segments(audio, language)
+        cleaned = []
+        for s, e, text in segments:
+            text = clean_segment(text) if config.CLEAN_HALLUCINATIONS else text.strip()
+            if text:
+                cleaned.append((s, e, text))
+        logger.info(
+            f"[{self._model_id}] lecture chunk: {len(audio)/config.SAMPLE_RATE:.1f}s audio "
+            f"in {time.time() - start:.1f}s, {len(cleaned)} segments, lang={detected}"
+        )
+        return cleaned, detected

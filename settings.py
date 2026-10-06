@@ -19,6 +19,12 @@ _DEFAULTS = {
     "model": "base.en",
     "hotkey_mode": "toggle",       # "toggle" or "hold"
     "sound_feedback": True,
+    # Lecture mode
+    "lecture_root": os.path.join(os.path.expanduser("~"), "Documents", "Lectures"),
+    "lecture_model": "small",
+    "last_course": "",
+    "lecture_keep_wav": False,
+    "calendar_url": "",            # optional iCal URL (TraiNex, Google, Outlook …)
 }
 
 

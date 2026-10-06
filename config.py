@@ -50,3 +50,19 @@ LOW_PRIORITY = True               # Run at below-normal priority
 LOG_TRANSCRIPTIONS = True
 LOG_FILE = "whisper-history.log"
 LOG_MAX_BYTES = 5 * 1024 * 1024  # 5 MB — rotate when exceeded
+
+# --- Lecture Mode ---
+LECTURE_CHUNK_S = 60              # Transcribe in ~60 s chunks while recording
+LECTURE_CUT_SEARCH_S = 5          # Cut chunks at the quietest moment in the last 5 s
+LECTURE_BEAM_SIZE = 5
+LECTURE_PARAGRAPH_S = 30          # Group transcript into ~30 s paragraphs
+LECTURE_MP3_BITRATE = 64          # kbps, mono speech
+LECTURE_OVERRUN_REMINDER_MIN = 15 # Remind to stop if still recording after the calendar slot
+HOTKEY_LECTURE_BOOKMARK = "<ctrl>+<shift>+b"
+
+# Models offered for lecture mode (multilingual Whisper, timestamped)
+LECTURE_MODELS = {
+    "small":          {"label": "Whisper Small (multilingual)",  "size": "~480 MB"},
+    "medium":         {"label": "Whisper Medium (multilingual)", "size": "~1.5 GB"},
+    "large-v3-turbo": {"label": "Whisper Large-v3 Turbo",        "size": "~1.6 GB"},
+}

@@ -9,7 +9,8 @@ Supports two modes:
   Hold:   Hold Ctrl+Shift+Space → start, release → stop
 
 Additional hotkeys:
-  Escape → cancel recording (discard without transcribing)
+  Escape           → cancel recording (discard without transcribing)
+  Ctrl+Shift+B     → bookmark the current moment (lecture mode only)
 """
 
 import logging
@@ -34,6 +35,7 @@ class HotkeyManager:
         self.on_toggle_dictation = None
         self.on_cancel_dictation = None
         self.on_stop_dictation = None    # For hold mode release
+        self.on_bookmark = None          # Ctrl+Shift+B (lecture bookmark)
         self._pressed = set()
         self._last_trigger = 0.0
         self._hotkey_active = False      # Track if hotkey combo is held
@@ -102,9 +104,18 @@ class HotkeyManager:
             return "space"
         if key == keyboard.Key.esc:
             return "escape"
+        # With Ctrl held, Windows reports B as char '\x02' — compare the vk code
+        if getattr(key, "vk", None) == 0x42 or getattr(key, "char", None) in ("b", "B", "\x02"):
+            return "b"
         return key
 
     def _check_hotkey_press(self):
+        if {"ctrl", "shift", "b"}.issubset(self._pressed):
+            now = time.time()
+            if now - self._last_trigger >= DEBOUNCE_S and self.on_bookmark:
+                self._last_trigger = now
+                self.on_bookmark()
+            return
         if {"ctrl", "shift", "space"}.issubset(self._pressed):
             now = time.time()
             if now - self._last_trigger < DEBOUNCE_S:
