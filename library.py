@@ -1,8 +1,8 @@
 """
 Lecture Library — browse, search and manage recorded lectures.
 
-  Courses │ Sessions (date, title, length, status) │ Transcript
-  Search box searches every transcript; clicking a hit jumps to it.
+  Sidebar: search + lectures grouped by course │ Reading view: transcript
+  The search box searches every transcript; clicking a hit jumps to it.
 
 Runs as its own process (tkinter needs a main thread).
 """
@@ -19,17 +19,11 @@ import lecture_store as store
 import settings
 import ui
 
-STATUS_LABELS = {
-    store.STATUS_RECORDING: "● recording",
-    store.STATUS_FINISHING: "… finishing",
-    store.STATUS_COMPLETE: "✓",
-    store.STATUS_INCOMPLETE: "⚠ gaps",
-}
-STATUS_COLORS = {
-    store.STATUS_RECORDING: ui.RECORD,
-    store.STATUS_FINISHING: ui.BOOKMARK,
-    store.STATUS_COMPLETE: ui.OK,
-    store.STATUS_INCOMPLETE: ui.WARN,
+STATUS_MARKS = {
+    store.STATUS_RECORDING: ("●", ui.RECORD),
+    store.STATUS_FINISHING: ("…", ui.BOOKMARK),
+    store.STATUS_COMPLETE: ("✓", ui.OK),
+    store.STATUS_INCOMPLETE: ("⚠", ui.WARN),
 }
 
 # Tk 8.6 can crash on characters outside the BMP (emoji) in Text.search
@@ -37,16 +31,40 @@ _NON_BMP = re.compile("[\U00010000-\U0010FFFF]")
 
 _TS_LINE = re.compile(r"^(> 🔖 |> ⚠ )?\*\*\[(\d{2}:\d{2}:\d{2})\]\*\*\s?(.*)$")
 
+# TraiNex names look like "M13 I Multivariate Verfahren, …" — module code first
+_COURSE_CODE = re.compile(r"^(M\d+\w*)\s+(?:I\s+)?(.+)$")
+
+BETTER_MODEL = "large-v3-turbo"
 SEARCH_DELAY_MS = 400
 RESULTS_PAGE = 40
+SIDEBAR_W = 330
+READING_W = 760       # max width of the transcript text, for comfortable reading
 
 
-def _when(started: str) -> str:
-    """'2026-10-06T14:02:00' → 'Mon 06.10.2026  ·  14:02'."""
+def _course_parts(name: str) -> tuple[str, str]:
+    """'M13 I Multivariate Verfahren' → ('M13', 'Multivariate Verfahren')."""
+    m = _COURSE_CODE.match(name)
+    return (m.group(1), m.group(2)) if m else ("", name)
+
+
+def _short_course(name: str) -> str:
+    code, rest = _course_parts(name)
+    return code or rest
+
+
+def _date(started: str, with_time: bool = False) -> str:
+    """'2026-10-06T14:02:00' → 'Tue 06.10.2026' (· 14:02)."""
     try:
-        return f"{datetime.fromisoformat(started):%a %d.%m.%Y  ·  %H:%M}"
+        d = datetime.fromisoformat(started)
     except ValueError:
         return started[:16].replace("T", " ")
+    return f"{d:%a %d.%m.%Y}" + (f", {d:%H:%M}" if with_time else "")
+
+
+def _minutes(seconds: float) -> str:
+    """5400 → '1 h 30 min', 2324 → '39 min'."""
+    m = int(round(seconds / 60))
+    return f"{m // 60} h {m % 60} min" if m >= 60 else f"{max(m, 1)} min"
 
 
 class LibraryWindow:
@@ -54,93 +72,93 @@ class LibraryWindow:
     def __init__(self):
         self.root_dir = settings.get("lecture_root")
         self.courses: list[dict] = []
-        self.sessions: list[dict] = []
+        self.rows: list[dict] = []       # course headings and sessions, as shown
         self.results: list[dict] = []
-        self.mode = "browse"       # or "search"
+        self.mode = "browse"             # or "search"
         self.current: str | None = None
         self._jobs: dict[str, object] = {}
         self._search_job = None
 
         self.win = ui.window("Lecture Library", resizable=True)
-        self.win.geometry("1180x720")
-        self.win.minsize(820, 450)
+        px = ui.px
+        self.win.geometry(f"{px(1180)}x{px(740)}")
+        self.win.minsize(px(820), px(480))
 
-        # ─── Search bar (seamless, as in history) ───────────
-        top = tk.Frame(self.win, bg=ui.BG, padx=20, pady=14)
+        panes = tk.PanedWindow(self.win, orient=tk.HORIZONTAL, bg=ui.BORDER, bd=0,
+                               sashwidth=1, sashrelief=tk.FLAT, showhandle=False)
+        panes.pack(fill=tk.BOTH, expand=True)
+
+        # ─── Sidebar ────────────────────────────────────────
+        side = tk.Frame(panes, bg=ui.BG)
+        top = tk.Frame(side, bg=ui.BG, padx=px(18), pady=px(16))
         top.pack(fill=tk.X)
-        self.search = ui.SearchField(top, "Search all lectures")
-        self.search.pack(side=tk.LEFT, fill=tk.X, expand=True, ipady=2)
+        self.search = ui.SearchField(top, "Search lectures")
+        self.search.pack(side=tk.LEFT, fill=tk.X, expand=True, ipady=px(2))
         self.search.bind("<Return>", lambda e: self._search())
         self.search.bind("<Escape>", lambda e: self._clear_search())
         self.search.var.trace_add("write", lambda *_: self._schedule_search())
         self.clear_link = ui.Link(top, "✕", self._clear_search, size=10, fg=ui.FG_DIM)
-        ui.Link(top, "Refresh", self.refresh, size=10).pack(side=tk.RIGHT, padx=(18, 0))
-        ui.Link(top, "Open lectures folder", lambda: launcher.open_path(self._ensure_root()),
-                size=10).pack(side=tk.RIGHT, padx=(18, 0))
 
-        self.status = tk.Label(self.win, text="", bg=ui.BG, fg=ui.FG_DIM, font=(ui.FONT, 9),
-                               anchor="w", padx=20, pady=6)
-        self.status.pack(side=tk.BOTTOM, fill=tk.X)
+        self.list_caption = ui.caption(side, "")
+        self.list = ui.CardList(side, self._build_row, self._on_select,
+                                selectable=lambda r: r["type"] != "course",
+                                padx=14, pady=8, gap=2)
 
-        # ─── Panes ──────────────────────────────────────────
-        panes = tk.PanedWindow(self.win, orient=tk.HORIZONTAL, bg=ui.BG, bd=0,
-                               sashwidth=10, sashrelief=tk.FLAT, showhandle=False)
-        panes.pack(fill=tk.BOTH, expand=True, padx=(12, 20))
+        foot = tk.Frame(side, bg=ui.BG, padx=px(18), pady=px(12))
+        foot.pack(side=tk.BOTTOM, fill=tk.X)
+        ui.Link(foot, "Open lectures folder", lambda: launcher.open_path(self._ensure_root())
+                ).pack(side=tk.LEFT)
+        ui.Link(foot, "Refresh", self.refresh).pack(side=tk.LEFT, padx=(px(16), 0))
+        self.list.pack(fill=tk.BOTH, expand=True, padx=(px(10), 0))
+        panes.add(side, minsize=px(240), width=px(SIDEBAR_W))
 
-        left = tk.Frame(panes, bg=ui.BG)
-        ui.caption(left, "Courses").pack(fill=tk.X, padx=12, pady=(0, 4))
-        self.course_list = ui.CardList(left, self._build_course, self._on_course_click,
-                                       card_bg=ui.BG, padx=12, pady=7, gap=0)
-        self.course_list.pack(fill=tk.BOTH, expand=True)
-        panes.add(left, minsize=180, width=250)
+        # ─── Reading view ───────────────────────────────────
+        read = tk.Frame(panes, bg=ui.BG, padx=px(28), pady=px(20))
+        self.title = tk.Label(read, bg=ui.BG, fg=ui.FG, font=(ui.FONT, 17, "bold"),
+                              anchor="w", justify=tk.LEFT)
+        self.title.pack(fill=tk.X)
+        self.meta = tk.Label(read, bg=ui.BG, fg=ui.FG_DIM, font=(ui.FONT, 10),
+                             anchor="w", justify=tk.LEFT)
+        self.meta.pack(fill=tk.X, pady=(px(2), 0))
+        self.notice = tk.Label(read, bg=ui.BG, font=(ui.FONT, 10), anchor="w", justify=tk.LEFT)
+        read.bind("<Configure>", lambda e: [w.config(wraplength=e.width - px(60))
+                                            for w in (self.title, self.meta, self.notice)])
 
-        middle = tk.Frame(panes, bg=ui.BG)
-        self.middle_label = ui.caption(middle, "Sessions")
-        self.middle_label.pack(fill=tk.X, pady=(0, 4))
-        self.session_list = ui.CardList(middle, self._build_card, self._on_card_select)
-        self.session_list.pack(fill=tk.BOTH, expand=True)
-        panes.add(middle, minsize=240, width=330)
+        self.actions = tk.Frame(read, bg=ui.BG)
+        self.actions.pack(fill=tk.X, pady=(px(14), px(14)))
+        self.buttons = [
+            ui.Button(self.actions, "▶  Play audio", self._play, kind="plain"),
+            ui.Button(self.actions, "Open transcript", self._open_transcript, kind="plain"),
+        ]
+        for b in self.buttons:
+            b.pack(side=tk.LEFT, padx=(0, px(8)))
+        self.more = ui.Link(self.actions, "More  ▾", self._more, size=10)
+        self.more.pack(side=tk.LEFT, padx=(px(10), 0))
 
-        right = tk.Frame(panes, bg=ui.BG)
-        self.header = tk.Label(right, text="", bg=ui.BG, fg=ui.FG, font=(ui.FONT, 13, "bold"),
-                               anchor="w", justify=tk.LEFT, wraplength=520)
-        self.header.pack(fill=tk.X, padx=(8, 0))
-        self.subheader = tk.Label(right, text="", bg=ui.BG, fg=ui.FG_DIM, font=(ui.FONT, 9),
-                                  anchor="w", justify=tk.LEFT, wraplength=520)
-        self.subheader.pack(fill=tk.X, padx=(8, 0))
-        right.bind("<Configure>", lambda e: (self.header.config(wraplength=e.width - 20),
-                                             self.subheader.config(wraplength=e.width - 20)))
+        self.status = tk.Label(read, text="", bg=ui.BG, fg=ui.FG_DIM, font=(ui.FONT, 9),
+                               anchor="w")
+        self.status.pack(side=tk.BOTTOM, fill=tk.X, pady=(px(8), 0))
 
-        actions = tk.Frame(right, bg=ui.BG)
-        actions.pack(fill=tk.X, padx=(8, 0), pady=(8, 8))
-        self.buttons = []
-        for label, cmd in (
-            ("▶  Play audio", self._play),
-            ("Open transcript", self._open_transcript),
-            ("Open folder", self._open_folder),
-            ("More  ▾", self._more),
-        ):
-            b = ui.Link(actions, label, cmd, size=10)
-            b.pack(side=tk.LEFT, padx=(0, 18))
-            self.buttons.append(b)
-
-        text_frame = tk.Frame(right, bg=ui.BG_ENTRY)
-        text_frame.pack(fill=tk.BOTH, expand=True)
-        self.text = tk.Text(text_frame, wrap=tk.WORD, font=(ui.FONT, 10), bg=ui.BG_ENTRY,
-                            fg=ui.FG, relief=tk.FLAT, bd=0, highlightthickness=0,
-                            padx=18, pady=14, spacing3=8, cursor="arrow")
-        scroll = ui.PillScrollbar(text_frame, command=self.text.yview, bg=ui.BG_ENTRY)
+        page = tk.Frame(read, bg=ui.BG_ENTRY)
+        page.pack(fill=tk.BOTH, expand=True)
+        self.text = tk.Text(page, wrap=tk.WORD, font=(ui.FONT, 11), bg=ui.BG_ENTRY, fg=ui.FG,
+                            relief=tk.FLAT, bd=0, highlightthickness=0, padx=px(32), pady=px(24),
+                            spacing1=px(2), spacing2=px(3), spacing3=px(12), cursor="arrow")
+        scroll = ui.PillScrollbar(page, command=self.text.yview, bg=ui.BG_ENTRY)
         self.text.configure(yscrollcommand=scroll.set, state=tk.DISABLED)
         scroll.pack(side=tk.RIGHT, fill=tk.Y)
         self.text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        # Keep lines at a readable length on wide windows
+        self.text.bind("<Configure>", lambda e: self.text.config(
+            padx=max(px(32), (e.width - px(READING_W)) // 2)))
         self.text.tag_configure("ts", foreground=ui.ACCENT, font=(ui.FONT, 9))
-        self.text.tag_configure("bookmark", foreground=ui.BOOKMARK, font=(ui.FONT, 10, "bold"))
+        self.text.tag_configure("bookmark", foreground=ui.BOOKMARK, font=(ui.FONT, 11, "bold"))
         self.text.tag_configure("warn", foreground=ui.WARN)
         self.text.tag_configure("hit", background=ui.HIGHLIGHT)
         self.text.tag_configure("message", foreground=ui.FG_DIM, justify=tk.CENTER)
+        panes.add(read, minsize=px(420))
 
-        panes.add(right, minsize=320)
-
+        self.win.bind("<Control-f>", lambda e: self.search.focus_set())
         self.refresh()
 
     # ─── Data ───────────────────────────────────────────────
@@ -150,99 +168,98 @@ class LibraryWindow:
         return self.root_dir
 
     def refresh(self):
-        selected = self._selected_course()
         self.courses = store.list_courses(self.root_dir)
+        if self.mode == "search":
+            self._search()
+        else:
+            self._show_browse()
+
+    def _show_browse(self):
+        self.rows = []
         for c in self.courses:
-            c["count"] = len(store.list_sessions(c["path"]))
-        self.course_list.set_items(self.courses, empty_text="No courses yet")
-        if not self.courses:
-            self.session_list.set_items([])
+            sessions = store.list_sessions(c["path"])
+            if sessions:
+                self.rows.append({"type": "course", **c})
+                self.rows += [{"type": "session", **s} for s in sessions]
+        self._set_caption("")
+        self.list.set_items(self.rows, empty_text="No lectures yet")
+        if not self.rows:
             self._show_message("No lectures yet.\n\nStart one from the tray icon:\n"
                                "right-click → Start lecture…")
             return
-        # Follow the open session (e.g. after “Move to…”), else keep the course
-        wanted = os.path.dirname(self.current) if self.current else (selected or {}).get("path")
-        idx = next((i for i, c in enumerate(self.courses)
-                    if os.path.normcase(c["path"]) == os.path.normcase(wanted or "")), 0)
-        self.course_list.select(idx, notify=False)
-        if self.mode == "browse":
-            self._on_course(keep_session=True)
+        idx = next((i for i, r in enumerate(self.rows)
+                    if r["type"] == "session" and r["path"] == self.current), self.list.first())
+        self.list.select(idx)
+
+    def _set_caption(self, text: str):
+        if text:
+            self.list_caption.config(text=text, padx=ui.px(18))
+            self.list_caption.pack(fill=tk.X, pady=(0, ui.px(6)), before=self.list)
         else:
-            self._search()
+            self.list_caption.pack_forget()
 
-    def _selected_course(self) -> dict | None:
-        i = self.course_list.selected
-        return self.courses[i] if i is not None and i < len(self.courses) else None
+    # ─── Sidebar rows ───────────────────────────────────────
 
-    # ─── Cards ──────────────────────────────────────────────
-
-    def _build_course(self, card, course):
-        tk.Label(card, text=str(course.get("count", "")), font=(ui.FONT, 9), fg=ui.FG_DIM
-                 ).pack(side=tk.RIGHT, padx=(8, 0))
-        tk.Label(card, text=course["name"], font=(ui.FONT, 10), fg=ui.FG, anchor="w",
-                 justify=tk.LEFT, wraplength=190).pack(side=tk.LEFT, fill=tk.X, expand=True)
-
-    def _build_card(self, card, item):
-        meta = tk.Frame(card)
-        meta.pack(fill=tk.X, pady=(0, 2))
-        if self.mode == "search":
-            info = f"{item['course']}  ·  {item['started'][:10]}  ·  {item['timestamp']}"
-            tk.Label(meta, text=info, font=(ui.FONT, 9), fg=ui.FG_DIM, anchor="w").pack(side=tk.LEFT)
-            tk.Label(card, text=item["title"], font=(ui.FONT, 10, "bold"), fg=ui.FG,
-                     anchor="w").pack(fill=tk.X)
-            tk.Label(card, text=_NON_BMP.sub("", item["snippet"]), font=(ui.FONT, 10), fg=ui.FG,
-                     anchor="w", justify=tk.LEFT, wraplength=280).pack(fill=tk.X)
+    def _build_row(self, frame, row):
+        px = ui.px
+        if row["type"] == "course":
+            code, rest = _course_parts(row["name"])
+            frame.config(padx=px(14), pady=px(6))
+            frame.pack_configure(pady=(px(12), px(2)))
+            if code:
+                tk.Label(frame, text=code, font=(ui.FONT, 9, "bold"), fg=ui.FG, anchor="w"
+                         ).pack(side=tk.LEFT, anchor="n")
+            tk.Label(frame, text=rest, font=(ui.FONT, 9), fg=ui.FG_DIM, anchor="w",
+                     justify=tk.LEFT, wraplength=px(SIDEBAR_W - 110)
+                     ).pack(side=tk.LEFT, padx=(px(6) if code else 0, 0), fill=tk.X)
             return
-        bits = [_when(item.get("started", ""))]
-        if item.get("duration_s"):
-            bits.append(store.format_duration(item["duration_s"]))
-        tk.Label(meta, text="  ·  ".join(bits), font=(ui.FONT, 9), fg=ui.FG_DIM,
+        if row["type"] == "hit":
+            info = f"{_short_course(row['course'])}  ·  {row['title']}  ·  {row['timestamp']}"
+            tk.Label(frame, text=info, font=(ui.FONT, 9), fg=ui.FG_DIM, anchor="w"
+                     ).pack(fill=tk.X)
+            tk.Label(frame, text=_NON_BMP.sub("", row["snippet"]), font=(ui.FONT, 10), fg=ui.FG,
+                     anchor="w", justify=tk.LEFT, wraplength=px(SIDEBAR_W - 70)).pack(fill=tk.X)
+            return
+        head = tk.Frame(frame)
+        head.pack(fill=tk.X)
+        tk.Label(head, text=row.get("title", ""), font=(ui.FONT, 10, "bold"), fg=ui.FG,
                  anchor="w").pack(side=tk.LEFT)
-        status = item.get("status", "")
-        if status in STATUS_LABELS:
-            tk.Label(meta, text=STATUS_LABELS[status], font=(ui.FONT, 9),
-                     fg=STATUS_COLORS[status]).pack(side=tk.RIGHT)
-        tk.Label(card, text=item.get("title", ""), font=(ui.FONT, 10), fg=ui.FG, anchor="w",
-                 justify=tk.LEFT, wraplength=280).pack(fill=tk.X)
+        mark, color = STATUS_MARKS.get(row.get("status", ""), ("", ui.FG_DIM))
+        if mark:
+            tk.Label(head, text=mark, font=(ui.FONT, 10), fg=color).pack(side=tk.RIGHT)
+        bits = [_date(row.get("started", ""))]
+        if row.get("duration_s"):
+            bits.append(_minutes(row["duration_s"]))
+        tk.Label(frame, text="  ·  ".join(bits), font=(ui.FONT, 9), fg=ui.FG_DIM, anchor="w"
+                 ).pack(fill=tk.X)
 
-    # ─── Browse ─────────────────────────────────────────────
-
-    def _on_course_click(self, _index: int):
+    def _on_select(self, i: int):
         if self.mode == "search":
-            self._clear_search()
+            if i < len(self.results):
+                r = self.results[i]
+                self._show_session(r["session_path"], jump_line=r["line"],
+                                   highlight=self.search.value())
+        elif i < len(self.rows) and self.rows[i]["type"] == "session":
+            self._show_session(self.rows[i]["path"])
+
+    # ─── Reading view ───────────────────────────────────────
+
+    def _enable_actions(self, on: bool):
+        for b in self.buttons:
+            b.config(state=tk.NORMAL if on else tk.DISABLED)
+        self.more.enable(on)
+        if on:
+            self.actions.pack(fill=tk.X, pady=(ui.px(14), ui.px(14)), after=self.meta)
         else:
-            self._on_course()
-
-    def _on_course(self, keep_session: bool = False):
-        course = self._selected_course()
-        previous = self.current
-        self.sessions = store.list_sessions(course["path"]) if course else []
-        self.middle_label.config(text=course["name"] if course else "Sessions")
-        self.session_list.set_items(self.sessions, empty_text="No sessions in this course.")
-        if self.sessions:
-            idx = next((i for i, s in enumerate(self.sessions)
-                        if keep_session and s["path"] == previous), 0)
-            self.session_list.select(idx)
-        else:
-            self._show_message("No sessions in this course.")
-
-    def _on_card_select(self, i: int):
-        if self.mode == "browse" and i < len(self.sessions):
-            self._show_session(self.sessions[i]["path"])
-        elif self.mode == "search" and i < len(self.results):
-            r = self.results[i]
-            self._show_session(r["session_path"], jump_line=r["line"],
-                               highlight=self.search.value())
-
-    # ─── Transcript view ────────────────────────────────────
+            self.actions.pack_forget()
 
     def _show_message(self, text: str):
         self.current = None
-        self.header.config(text="")
-        self.subheader.config(text="")
+        self.title.config(text="")
+        self.meta.config(text="")
+        self.notice.pack_forget()
+        self._enable_actions(False)
         self._set_text([("\n\n" + text, ("message",))])
-        for b in self.buttons:
-            b.enable(False)
 
     def _set_text(self, parts):
         self.text.configure(state=tk.NORMAL)
@@ -254,27 +271,31 @@ class LibraryWindow:
     def _show_session(self, path: str, jump_line: int | None = None, highlight: str = ""):
         self.current = path
         meta = store.load_meta(path)
-        for b in self.buttons:
-            b.enable(True)
+        self._enable_actions(True)
 
-        self.header.config(text=meta.get("title", ""))
-        bits = [meta.get("course", ""), _when(meta.get("started", ""))]
+        self.title.config(text=meta.get("title", ""))
+        bits = [meta.get("course", ""), _date(meta.get("started", ""), with_time=True)]
         if meta.get("duration_s"):
-            bits.append(store.format_duration(meta["duration_s"]))
-        for key in ("lecturer", "room"):
-            if meta.get(key):
-                bits.append(meta[key])
-        langs = meta.get("detected_languages") or []
-        bits.append(", ".join(langs) if langs else store.LANGUAGES.get(meta.get("language", "auto"), ""))
+            bits.append(_minutes(meta["duration_s"]))
+        bits += [meta[k] for k in ("lecturer", "room") if meta.get(k)]
+        if meta.get("bookmarks"):
+            n = len(meta["bookmarks"])
+            bits.append(f"★ {n} bookmark{'s' if n != 1 else ''}")
+        self.meta.config(text="  ·  ".join(b for b in bits if b))
+
+        notice, color = "", ui.FG_DIM
         status = meta.get("status", "")
         if status == store.STATUS_INCOMPLETE:
-            bits.append(f"⚠ {meta.get('failed_chunks', 0)} part(s) failed — try “Transcribe again”")
+            notice, color = (f"⚠ {meta.get('failed_chunks', 0)} part(s) could not be "
+                             "transcribed — More ▾ → Transcribe again"), ui.WARN
         elif status in (store.STATUS_RECORDING, store.STATUS_FINISHING):
             done = store.format_duration(meta.get("transcribed_until_s", 0))
-            bits.append(f"{STATUS_LABELS[status]} (text to {done})")
-        if meta.get("bookmarks"):
-            bits.append(f"★ {len(meta['bookmarks'])} bookmark(s)")
-        self.subheader.config(text="  ·  ".join(b for b in bits if b))
+            notice, color = f"{STATUS_MARKS[status][0]} Still transcribing — text up to {done}", ui.BOOKMARK
+        if notice:
+            self.notice.config(text=notice, fg=color)
+            self.notice.pack(fill=tk.X, pady=(ui.px(6), 0), after=self.meta)
+        else:
+            self.notice.pack_forget()
 
         md = os.path.join(path, store.TRANSCRIPT_MD)
         try:
@@ -295,12 +316,13 @@ class LibraryWindow:
             m = _TS_LINE.match(line)
             if m:
                 prefix, ts, text = m.groups()
+                ts = ts[3:] if ts.startswith("00:") else ts     # 00:12:34 → 12:34
                 if prefix and "🔖" in prefix:
                     parts.append((f"★ {ts}  {text}\n", ("bookmark",)))
                 elif prefix:
                     parts.append((f"⚠ {ts}  {text}\n", ("warn",)))
                 else:
-                    parts.append((f"{ts}   ", ("ts",)))
+                    parts.append((f"{ts}    ", ("ts",)))
                     parts.append((text + "\n", ()))
             else:
                 parts.append((line + "\n", ()))
@@ -343,28 +365,28 @@ class LibraryWindow:
             self._clear_search()
             return
         self.mode = "search"
-        self.clear_link.pack(side=tk.LEFT, padx=(8, 0))
-        self.results = store.search(self.root_dir, query)
+        self.clear_link.pack(side=tk.LEFT, padx=(ui.px(8), 0))
+        self.results = [{"type": "hit", **r} for r in store.search(self.root_dir, query)]
         n = len(self.results)
-        self.middle_label.config(text=f"{n} match{'es' if n != 1 else ''} for “{query}”")
-        self.session_list.set_items(self.results[:RESULTS_PAGE], empty_text="Nothing found.")
+        self._set_caption(f"{n} match{'es' if n != 1 else ''}")
+        self.list.set_items(self.results[:RESULTS_PAGE], empty_text="Nothing found.")
         self._show_more_link()
         if self.results:
-            self.session_list.select(0)
+            self.list.select(0)
         else:
             self._show_message("Nothing found.")
 
     def _show_more_link(self):
         """Cards are slow to build in bulk — show results a page at a time."""
-        shown = len(self.session_list.cards)
-        if shown < len(self.results):
-            ui.Link(self.session_list.inner, f"Show more  ({len(self.results) - shown} left)",
-                    self._show_more, size=10).pack(pady=12)
+        shown = len(self.list.cards)
+        if self.mode == "search" and shown < len(self.results):
+            ui.Link(self.list.inner, f"Show more  ({len(self.results) - shown} left)",
+                    self._show_more, size=10).pack(pady=ui.px(12))
 
     def _show_more(self):
-        shown = len(self.session_list.cards)
-        self.session_list.inner.winfo_children()[-1].destroy()
-        self.session_list.add_items(self.results[shown:shown + RESULTS_PAGE])
+        shown = len(self.list.cards)
+        self.list.inner.winfo_children()[-1].destroy()
+        self.list.add_items(self.results[shown:shown + RESULTS_PAGE])
         self._show_more_link()
 
     def _clear_search(self):
@@ -375,7 +397,7 @@ class LibraryWindow:
         self.clear_link.pack_forget()
         if self.search.value():
             self.search.clear()
-        self._on_course()
+        self._show_browse()
 
     # ─── Actions ────────────────────────────────────────────
 
@@ -384,7 +406,7 @@ class LibraryWindow:
         if audio:
             launcher.open_path(audio)
         else:
-            self.status.config(text="No audio file in this session.")
+            self.status.config(text="No audio file in this lecture.")
 
     def _open_transcript(self):
         if self.current:
@@ -394,25 +416,65 @@ class LibraryWindow:
         if self.current:
             launcher.open_path(self.current)
 
-    def _retranscribe(self):
-        path = self.current
-        if not path or path in self._jobs:
+    def _more(self):
+        """Less frequent actions; “Move to course” lists the courses."""
+        if not self.current:
             return
+        current_course = store.load_meta(self.current).get("course", "")
+        menu = ui.popup_menu(self.win)
+        menu.add_command(label="Improve transcript (more accurate model)…", command=self._improve)
+        menu.add_command(label="Transcribe again…", command=self._retranscribe)
+        menu.add_separator()
+        menu.add_command(label="Rename…", command=self._rename)
+        move = ui.popup_menu(menu)
+        for c in self.courses:
+            if c["name"] != current_course:
+                move.add_command(label=c["name"], command=lambda n=c["name"]: self._move_to(n))
+        if move.index(tk.END) is not None:
+            move.add_separator()
+        move.add_command(label="New course…", command=self._move_to_new)
+        menu.add_cascade(label="Move to course", menu=move)
+        menu.add_command(label="Open folder", command=self._open_folder)
+        menu.tk_popup(self.more.winfo_rootx(), self.more.winfo_rooty() + self.more.winfo_height())
+
+    def _improve(self):
+        if not self._can_transcribe(self.current):
+            return
+        minutes = _minutes(store.load_meta(self.current).get("duration_s", 0))
+        if messagebox.askyesno(
+                "Improve transcript",
+                "Transcribe this lecture again with Whisper Large v3 Turbo?\n\n"
+                "It is clearly more accurate, especially with technical terms, "
+                f"but slower: expect roughly as long as the recording ({minutes}). "
+                "It runs in the background on the power-saving cores, so you can keep "
+                "using your laptop. The first time downloads the model (1.6 GB).",
+                parent=self.win):
+            self._start_job(self.current, BETTER_MODEL)
+
+    def _retranscribe(self):
+        if self._can_transcribe(self.current) and messagebox.askyesno(
+                "Transcribe again",
+                "Re-transcribe this lecture from its audio with the lecture model?\n\n"
+                "The current transcript will be replaced. This runs in the background "
+                "and can take a while for a long lecture.", parent=self.win):
+            self._start_job(self.current)
+
+    def _can_transcribe(self, path: str | None) -> bool:
+        if not path or path in self._jobs:
+            return False
         if store.is_session_busy(path):
             messagebox.showinfo("Still recording",
                                 "This lecture is still being recorded or finished by the app.",
                                 parent=self.win)
-            return
+            return False
         if not store.find_audio(path):
-            messagebox.showwarning("No audio", "This session has no audio file.", parent=self.win)
-            return
-        if not messagebox.askyesno(
-                "Transcribe again",
-                "Re-transcribe this lecture from its audio?\n\n"
-                "The current transcript will be replaced. This runs in the background "
-                "and can take a while for a long lecture.", parent=self.win):
-            return
-        proc = launcher.spawn("lecture", "--transcribe", path)
+            messagebox.showwarning("No audio", "This lecture has no audio file.", parent=self.win)
+            return False
+        return True
+
+    def _start_job(self, path: str, model: str | None = None):
+        args = ["--transcribe", path] + (["--model", model] if model else [])
+        proc = launcher.spawn("lecture", *args)
         if proc is None:
             return
         self._jobs[path] = proc
@@ -427,13 +489,13 @@ class LibraryWindow:
         if proc.poll() is None:
             done = store.format_duration(meta.get("transcribed_until_s", 0))
             total = store.format_duration(meta.get("duration_s", 0))
-            self.status.config(text=f"Transcribing “{meta.get('title', '')}”… {done} / {total}")
+            self.status.config(text=f"Transcribing “{meta.get('title', '')}”…  {done} / {total}")
             self.win.after(2000, lambda: self._poll_job(path))
             return
         del self._jobs[path]
         ok = proc.returncode == 0
         self.status.config(text=f"“{meta.get('title', '')}”: "
-                                + ("transcription finished." if ok else "transcription failed — see whisper.log."))
+                                + ("new transcript ready." if ok else "transcription failed — see whisper.log."))
         self.refresh()
         if self.current == path:
             self._show_session(path)
@@ -450,25 +512,6 @@ class LibraryWindow:
             except OSError as e:
                 messagebox.showerror("Rename failed", str(e), parent=self.win)
             self.refresh()
-
-    def _more(self):
-        """Less frequent actions; “Move to” lists the courses."""
-        if not self.current:
-            return
-        current_course = store.load_meta(self.current).get("course", "")
-        menu = ui.popup_menu(self.win)
-        menu.add_command(label="Transcribe again…", command=self._retranscribe)
-        menu.add_command(label="Rename…", command=self._rename)
-        move = ui.popup_menu(menu)
-        for c in self.courses:
-            if c["name"] != current_course:
-                move.add_command(label=c["name"], command=lambda n=c["name"]: self._move_to(n))
-        if move.index(tk.END) is not None:
-            move.add_separator()
-        move.add_command(label="New course…", command=self._move_to_new)
-        menu.add_cascade(label="Move to course", menu=move)
-        link = self.buttons[-1]
-        menu.tk_popup(link.winfo_rootx(), link.winfo_rooty() + link.winfo_height())
 
     def _move_to_new(self):
         course = simpledialog.askstring("Move to new course", "Course name:", parent=self.win)

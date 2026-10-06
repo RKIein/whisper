@@ -34,6 +34,40 @@ STATE_LECTURE_PAUSED = "lecture_paused"
 STATE_LECTURE_FINISHING = "lecture_finishing"
 
 
+def context_prompt(meta: dict) -> str | None:
+    """'Seminar: M13 Multivariate Verfahren …' — primes Whisper with the subject's vocabulary."""
+    course = (meta.get("course") or "").strip()
+    if not course:
+        return None
+    kind = (meta.get("kind") or "").strip()
+    return f"{kind}: {course}." if kind else f"{course}."
+
+
+class LanguageLock:
+    """
+    “Auto-detect” settles on the first language heard clearly.
+
+    Detecting per chunk let quiet or noisy minutes come out as Russian or
+    Polish gibberish; once a chunk has real speech, keep its language.
+    """
+
+    MIN_SEGMENTS = 3
+
+    def __init__(self, language: str | None):
+        self.chosen = None if language in (None, "", "auto") else language
+
+    @property
+    def current(self) -> str:
+        return self.chosen or "auto"
+
+    def observe(self, detected: str | None, n_segments: int) -> bool:
+        """Returns True when this chunk settled the language."""
+        if self.chosen is None and detected and n_segments >= self.MIN_SEGMENTS:
+            self.chosen = detected
+            return True
+        return False
+
+
 class LectureSession:
     """
     One recorded lecture. Create, start(), optionally pause()/bookmark(),
@@ -54,6 +88,8 @@ class LectureSession:
         self.meta: dict = {}
         self.writer: store.TranscriptWriter | None = None
         self.language = "auto"
+        self._lang = LanguageLock("auto")
+        self._prompt: str | None = None
 
         self._audio_queue: queue.Queue = queue.Queue(maxsize=2000)
         self._work_queue: queue.Queue = queue.Queue()
@@ -117,6 +153,8 @@ class LectureSession:
             calendar=calendar,
         )
         self.meta = store.load_meta(self.session_dir)
+        self._lang = LanguageLock(self.language)
+        self._prompt = context_prompt(self.meta)
         self.writer = store.TranscriptWriter(self.session_dir, config.LECTURE_PARAGRAPH_S)
         self.writer.write_header(self.meta)
         self._wav = store.WavAppender(
@@ -287,8 +325,15 @@ class LectureSession:
         if duration < config.MIN_SPEECH_DURATION_S:
             return
         try:
-            segments, detected = self.transcriber.transcribe_segments(audio, self.language)
+            segments, detected = self.transcriber.transcribe_segments(
+                audio, self._lang.current, prompt=self._prompt)
             self.writer.append_segments(segments, offset_s)
+            if self._lang.observe(detected, len(segments)):
+                logger.info(f"Lecture language settled on '{detected}'")
+                # Remember it for the course, so next time it starts out right
+                course = self.meta.get("course", "")
+                if course and store.load_course(store.course_dir(self.root, course))["language"] == "auto":
+                    store.ensure_course(self.root, course, detected)
             with self._meta_lock:
                 if detected and detected not in self.meta.setdefault("detected_languages", []):
                     self.meta["detected_languages"].append(detected)
@@ -417,10 +462,12 @@ def retranscribe(session_dir: str, model_id: str | None = None, on_progress=None
         writer.add_bookmark(b["t"], b.get("label", "Bookmark"))
 
     chunks = store.split_chunks(audio, sr, config.LECTURE_CHUNK_S, config.LECTURE_CUT_SEARCH_S)
-    language = meta.get("language", "auto")
+    lang = LanguageLock(meta.get("language", "auto"))
+    prompt = context_prompt(meta)
     for i, (offset_s, chunk) in enumerate(chunks):
         try:
-            segments, detected = transcriber.transcribe_segments(chunk, language)
+            segments, detected = transcriber.transcribe_segments(chunk, lang.current, prompt=prompt)
+            lang.observe(detected, len(segments))
             writer.append_segments(segments, offset_s)
             if detected and detected not in meta["detected_languages"]:
                 meta["detected_languages"].append(detected)
@@ -442,6 +489,21 @@ def retranscribe(session_dir: str, model_id: str | None = None, on_progress=None
     return meta
 
 
+def _limit_cpu():
+    """Same limits as the tray app, so a background re-transcription doesn't slow the laptop."""
+    try:
+        import psutil
+        p = psutil.Process()
+        if config.LOW_PRIORITY:
+            p.nice(psutil.BELOW_NORMAL_PRIORITY_CLASS)
+        n = config.MAX_INFERENCE_THREADS
+        count = psutil.cpu_count(logical=True)
+        if count and count > n:
+            p.cpu_affinity(list(range(count - n, count)))
+    except Exception as e:
+        logger.warning(f"Could not set CPU limits: {e}")
+
+
 def main(argv: list[str]):
     import argparse
     parser = argparse.ArgumentParser(description="Lecture transcription tools")
@@ -453,6 +515,7 @@ def main(argv: list[str]):
     if args.transcribe:
         logging.basicConfig(level=logging.INFO,
                             format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
+        _limit_cpu()
         def say(msg):
             if sys.stdout is not None:   # None under pythonw.exe
                 print(msg, flush=True)

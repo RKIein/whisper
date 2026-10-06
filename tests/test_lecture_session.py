@@ -20,7 +20,7 @@ class FakeTranscriber:
     def load(self, on_progress=None):
         pass
 
-    def transcribe_segments(self, audio, language=None):
+    def transcribe_segments(self, audio, language=None, prompt=None):
         dur = len(audio) / SR
         self.calls.append((dur, language))
         return [(0.0, dur, f"chunk of {dur:.1f} seconds")], "de"

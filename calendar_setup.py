@@ -24,45 +24,45 @@ class CalendarSetup:
 
     def __init__(self):
         self.win = ui.window("Timetable")
-        self.win.configure(padx=24, pady=20)
+        self.win.configure(padx=ui.px(24), pady=ui.px(20))
 
         ui.heading(self.win, "Timetable").pack(anchor="w")
         tk.Label(self.win, bg=ui.BG, fg=ui.FG_DIM, font=(ui.FONT, 9), justify=tk.LEFT,
-                 anchor="w", wraplength=WIDTH - 48,
+                 anchor="w", wraplength=ui.px(WIDTH - 48),
                  text="When you start a lecture, the event on right now fills in "
-                      "course, type, room and lecturer.").pack(fill=tk.X, pady=(2, 14))
+                      "course, type, room and lecturer.").pack(fill=tk.X, pady=(ui.px(2), ui.px(14)))
 
         # ─── Status card ────────────────────────────────────
-        card = tk.Frame(self.win, bg=ui.BG_ENTRY, padx=14, pady=12)
+        card = tk.Frame(self.win, bg=ui.BG_ENTRY, padx=ui.px(14), pady=ui.px(12))
         card.pack(fill=tk.X)
         self.status = tk.Label(card, font=(ui.FONT, 11, "bold"), bg=ui.BG_ENTRY, anchor="w")
         self.status.pack(fill=tk.X)
         self.range = tk.Label(card, font=(ui.FONT, 9), fg=ui.FG_DIM, bg=ui.BG_ENTRY,
-                              anchor="w", justify=tk.LEFT, wraplength=WIDTH - 76)
+                              anchor="w", justify=tk.LEFT, wraplength=ui.px(WIDTH - 76))
         self.range.pack(fill=tk.X)
         self.actions = tk.Frame(card, bg=ui.BG_ENTRY)
-        self.actions.pack(fill=tk.X, pady=(10, 0))
+        self.actions.pack(fill=tk.X, pady=(ui.px(10), 0))
 
         # ─── Upcoming events ────────────────────────────────
         self.day_caption = ui.caption(self.win, "Today")
-        self.day_caption.pack(fill=tk.X, pady=(16, 4))
+        self.day_caption.pack(fill=tk.X, pady=(ui.px(16), ui.px(4)))
         self.day_list = tk.Frame(self.win, bg=ui.BG)
         self.day_list.pack(fill=tk.X)
 
         # ─── Subscription link ──────────────────────────────
         self.url_caption = ui.caption(
             self.win, "Or subscribe by link (refreshed every 6 h, works offline)")
-        self.url_caption.pack(fill=tk.X, pady=(18, 4))
+        self.url_caption.pack(fill=tk.X, pady=(ui.px(18), ui.px(4)))
         row = tk.Frame(self.win, bg=ui.BG)
         row.pack(fill=tk.X)
         self.url_var = tk.StringVar(value=settings.get("calendar_url", ""))
         url = ui.Field(row, self.url_var, width=40, size=9)
         url.pack(side=tk.LEFT, fill=tk.X, expand=True)
         url.entry.bind("<Return>", lambda e: self._save_url())
-        ui.Link(row, "Save link", self._save_url, size=10).pack(side=tk.LEFT, padx=(12, 0))
+        ui.Link(row, "Save link", self._save_url, size=10).pack(side=tk.LEFT, padx=(ui.px(12), 0))
 
         bottom = tk.Frame(self.win, bg=ui.BG)
-        bottom.pack(fill=tk.X, pady=(20, 0))
+        bottom.pack(fill=tk.X, pady=(ui.px(20), 0))
         ui.Button(bottom, "Done", self.win.destroy, kind="plain").pack(side=tk.RIGHT)
         self.win.bind("<Escape>", lambda e: self.win.destroy())
 
@@ -80,7 +80,7 @@ class CalendarSetup:
             ui.Link(self.actions, "Import another file…", self._import, bg=ui.BG_ENTRY,
                     size=10).pack(side=tk.LEFT)
             ui.Link(self.actions, "Remove", self._remove, bg=ui.BG_ENTRY,
-                    size=10).pack(side=tk.LEFT, padx=(18, 0))
+                    size=10).pack(side=tk.LEFT, padx=(ui.px(18), 0))
         else:
             ui.Button(self.actions, "Import .ics file…", self._import).pack(side=tk.LEFT)
 
@@ -120,21 +120,21 @@ class CalendarSetup:
             self.day_list.pack_forget()
             return
         self.day_caption.config(text=label)
-        self.day_caption.pack(fill=tk.X, pady=(16, 4), before=self.url_caption)
+        self.day_caption.pack(fill=tk.X, pady=(ui.px(16), ui.px(4)), before=self.url_caption)
         self.day_list.pack(fill=tk.X, before=self.url_caption)
         if not events:
             tk.Label(self.day_list, text="No events.", font=(ui.FONT, 10), fg=ui.FG_DIM,
                      bg=ui.BG, anchor="w").pack(fill=tk.X)
             return
         for e in events:
-            card = tk.Frame(self.day_list, bg=ui.BG_ENTRY, padx=14, pady=8)
-            card.pack(fill=tk.X, pady=(0, 2))
+            card = tk.Frame(self.day_list, bg=ui.BG_ENTRY, padx=ui.px(14), pady=ui.px(8))
+            card.pack(fill=tk.X, pady=(0, ui.px(2)))
             meta = "  ·  ".join(x for x in (f"{e.start:%H:%M}–{e.end:%H:%M}", e.kind, e.room) if x)
             tk.Label(card, text=meta, font=(ui.FONT, 9), fg=ui.FG_DIM, bg=ui.BG_ENTRY,
                      anchor="w").pack(fill=tk.X)
             tk.Label(card, text=e.course or e.summary, font=(ui.FONT, 10), fg=ui.FG,
                      bg=ui.BG_ENTRY, anchor="w", justify=tk.LEFT,
-                     wraplength=WIDTH - 76).pack(fill=tk.X)
+                     wraplength=ui.px(WIDTH - 76)).pack(fill=tk.X)
             if e.lecturer:
                 tk.Label(card, text=e.lecturer, font=(ui.FONT, 9), fg=ui.FG_DIM, bg=ui.BG_ENTRY,
                          anchor="w").pack(fill=tk.X)
