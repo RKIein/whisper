@@ -270,6 +270,47 @@ class SearchField(tk.Entry):
             self._show_placeholder()
 
 
+class Slider(tk.Canvas):
+    """Thin seek bar: click or drag to jump. on_seek(fraction) fires on release."""
+
+    def __init__(self, parent, on_seek, bg: str = BG_ENTRY):
+        super().__init__(parent, height=px(20), bg=bg, highlightthickness=0, bd=0, cursor="hand2")
+        self._on_seek = on_seek
+        self._value = 0.0
+        self._dragging = False
+        self.bind("<Configure>", lambda e: self._draw())
+        self.bind("<ButtonPress-1>", self._drag)
+        self.bind("<B1-Motion>", self._drag)
+        self.bind("<ButtonRelease-1>", self._release)
+
+    def set(self, fraction: float):
+        if not self._dragging:
+            self._value = max(0.0, min(1.0, fraction))
+            self._draw()
+
+    def _x_to_fraction(self, x: int) -> float:
+        pad = px(6)
+        return max(0.0, min(1.0, (x - pad) / max(1, self.winfo_width() - 2 * pad)))
+
+    def _drag(self, event):
+        self._dragging = True
+        self._value = self._x_to_fraction(event.x)
+        self._draw()
+
+    def _release(self, event):
+        self._dragging = False
+        self._on_seek(self._x_to_fraction(event.x))
+
+    def _draw(self):
+        self.delete("all")
+        w, h, pad = self.winfo_width(), self.winfo_height(), px(6)
+        y, x = h / 2, pad + self._value * (w - 2 * pad)
+        self.create_line(pad, y, w - pad, y, fill=BORDER, width=px(4), capstyle=tk.ROUND)
+        self.create_line(pad, y, x, y, fill=ACCENT, width=px(4), capstyle=tk.ROUND)
+        r = px(6)
+        self.create_oval(x - r, y - r, x + r, y + r, fill=ACCENT, outline=BG_ENTRY, width=px(2))
+
+
 # ─── Scrolling list of cards ─────────────────────────────────
 
 class ScrollArea(tk.Frame):
@@ -360,14 +401,15 @@ class CardList(ScrollArea):
             set_bg(card, self._card_bg)
             self.cards.append(card)
 
-    def select(self, i: int, focus: bool = False, notify: bool = True):
+    def select(self, i: int, focus: bool = False, notify: bool = True, scroll: bool = True):
         if not (0 <= i < len(self.cards)) or i in self._headings:
             return
         previous, self.selected = self.selected, i
         if previous is not None and previous < len(self.cards):
             set_bg(self.cards[previous], self._card_bg)
         set_bg(self.cards[i], BG_SELECTED)
-        self.see(self.cards[i])
+        if scroll:
+            self.see(self.cards[i])
         if focus:
             self.canvas.focus_set()
         if notify:
