@@ -150,6 +150,16 @@ MODEL_REGISTRY = {
         "model": "model.onnx",
         "tokens": "tokens.txt",
     },
+    # Parakeet TDT 0.6B v3 (sherpa-onnx, NVIDIA — top accuracy)
+    "parakeet-tdt-0.6b-v3": {
+        "backend": "sherpa-nemo-transducer",
+        "repo": "csukuangfj/sherpa-onnx-nemo-parakeet-tdt-0.6b-v3-int8",
+        "encoder": "encoder.int8.onnx",
+        "decoder": "decoder.int8.onnx",
+        "joiner": "joiner.int8.onnx",
+        "tokens": "tokens.txt",
+        "feature_dim": 128,
+    },
     # SenseVoice (sherpa-onnx)
     "sensevoice-small": {
         "backend": "sherpa-sensevoice",
@@ -298,6 +308,91 @@ class _SherpaNemoCTCBackend:
         return stream.result.text.strip()
 
 
+class _SherpaNemoTransducerBackend:
+    """Sherpa-ONNX NeMo Transducer backend (Parakeet TDT)."""
+
+    def __init__(self, model_info: dict, on_progress=None):
+        import sherpa_onnx
+
+        if on_progress:
+            on_progress(f"Downloading model…")
+
+        model_dir = _get_sherpa_model_dir(model_info["repo"])
+        decoder_path = os.path.join(model_dir, model_info["decoder"])
+
+        # NeMo ONNX exports lack required metadata in the decoder file.
+        # Patch it once so sherpa-onnx's from_transducer() can load it.
+        self._patch_decoder_metadata(decoder_path)
+
+        if on_progress:
+            on_progress(f"Loading Parakeet TDT…")
+
+        feature_dim = model_info.get("feature_dim", 80)
+        start = time.time()
+        self._recognizer = sherpa_onnx.OfflineRecognizer.from_transducer(
+            encoder=os.path.join(model_dir, model_info["encoder"]),
+            decoder=decoder_path,
+            joiner=os.path.join(model_dir, model_info["joiner"]),
+            tokens=os.path.join(model_dir, model_info["tokens"]),
+            num_threads=config.MAX_INFERENCE_THREADS,
+            sample_rate=config.SAMPLE_RATE,
+            feature_dim=feature_dim,
+            model_type="nemo_transducer",
+            decoding_method="greedy_search",
+            provider="cpu",
+        )
+        logger.info(f"Parakeet TDT loaded ({time.time() - start:.1f}s)")
+
+    @staticmethod
+    def _patch_decoder_metadata(decoder_path: str):
+        """Add missing vocab_size/context_size to NeMo decoder ONNX metadata."""
+        import onnxruntime as ort
+
+        sess = ort.InferenceSession(decoder_path)
+        meta = dict(sess.get_modelmeta().custom_metadata_map)
+        del sess
+
+        if "vocab_size" in meta and "context_size" in meta:
+            return  # Already patched
+
+        import onnx
+
+        logger.info("Patching NeMo decoder metadata (one-time fix)…")
+        model = onnx.load(decoder_path)
+        existing = {p.key for p in model.metadata_props}
+
+        # Read vocab_size from encoder (same directory)
+        encoder_path = decoder_path.replace("decoder", "encoder")
+        enc_sess = ort.InferenceSession(encoder_path)
+        enc_meta = dict(enc_sess.get_modelmeta().custom_metadata_map)
+        del enc_sess
+        vocab_size = enc_meta.get("vocab_size", "1024")
+
+        if "vocab_size" not in existing:
+            entry = model.metadata_props.add()
+            entry.key = "vocab_size"
+            entry.value = vocab_size
+
+        if "context_size" not in existing:
+            entry = model.metadata_props.add()
+            entry.key = "context_size"
+            entry.value = "2"
+
+        onnx.save(model, decoder_path)
+        logger.info(f"Decoder metadata patched: vocab_size={vocab_size}, context_size=2")
+
+    def transcribe(self, audio: np.ndarray) -> str:
+        if audio.dtype != np.float32:
+            audio = audio.astype(np.float32)
+        if audio.ndim > 1:
+            audio = audio.flatten()
+
+        stream = self._recognizer.create_stream()
+        stream.accept_waveform(config.SAMPLE_RATE, audio)
+        self._recognizer.decode_stream(stream)
+        return stream.result.text.strip()
+
+
 class _SherpaSenseVoiceBackend:
     """Sherpa-ONNX SenseVoice backend."""
 
@@ -392,6 +487,8 @@ class Transcriber:
             self._backend = _MoonshineBackend(info["model_path"], on_progress)
         elif backend_type == "sherpa-nemo-ctc":
             self._backend = _SherpaNemoCTCBackend(info, on_progress)
+        elif backend_type == "sherpa-nemo-transducer":
+            self._backend = _SherpaNemoTransducerBackend(info, on_progress)
         elif backend_type == "sherpa-sensevoice":
             self._backend = _SherpaSenseVoiceBackend(info, on_progress)
         else:

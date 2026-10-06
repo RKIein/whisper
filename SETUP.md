@@ -74,7 +74,9 @@ Switch models from the tray menu. Available backends:
 - **Whisper** (faster-whisper): base.en, small.en, medium.en
 - **Distil-Whisper**: distil-small.en, distil-medium.en
 - **Moonshine** (ONNX): moonshine-tiny, moonshine-base
+- **Whisper Large v3 Turbo** (faster-whisper): large-v3-turbo
 - **Parakeet CTC** (sherpa-onnx): parakeet-ctc-110m
+- **Parakeet TDT** (sherpa-onnx): parakeet-tdt-0.6b-v3
 - **SenseVoice** (sherpa-onnx): sensevoice-small
 
 ## Configuration

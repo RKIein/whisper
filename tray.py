@@ -107,20 +107,23 @@ def _create_icon_image(state: str = STATE_IDLE) -> Image.Image:
 # Grouped by backend. Labels show in the tray menu.
 
 MODELS = {
+    # Moonshine (ONNX, by Useful Sensors) — ultralight
+    "moonshine-tiny":        {"label": "Moonshine Tiny",          "size": "~26 MB"},
+    "moonshine-base":        {"label": "Moonshine Base",          "size": "~58 MB"},
     # Whisper (faster-whisper)
-    "base.en":          {"label": "Whisper Base",          "size": "~150 MB"},
-    "small.en":         {"label": "Whisper Small",         "size": "~500 MB"},
-    "medium.en":        {"label": "Whisper Medium",        "size": "~1.5 GB"},
+    "base.en":               {"label": "Whisper Base",            "size": "~150 MB"},
+    "small.en":              {"label": "Whisper Small",           "size": "~500 MB"},
+    "medium.en":             {"label": "Whisper Medium",          "size": "~1.5 GB"},
     # Distil-Whisper (faster-whisper, distilled)
-    "distil-small.en":  {"label": "Distil-Whisper Small",  "size": "~350 MB"},
-    "distil-medium.en": {"label": "Distil-Whisper Medium", "size": "~750 MB"},
-    # Moonshine (ONNX, by Useful Sensors)
-    "moonshine-tiny":   {"label": "Moonshine Tiny",        "size": "~26 MB"},
-    "moonshine-base":   {"label": "Moonshine Base",        "size": "~58 MB"},
-    # Parakeet CTC (sherpa-onnx, NVIDIA)
-    "parakeet-ctc-110m":  {"label": "Parakeet CTC 110M",   "size": "~420 MB"},
+    "distil-small.en":       {"label": "Distil-Whisper Small",    "size": "~350 MB"},
+    "distil-medium.en":      {"label": "Distil-Whisper Medium",   "size": "~750 MB"},
+    # Whisper Large v3 Turbo (faster-whisper, pruned decoder)
+    "large-v3-turbo":        {"label": "Whisper Large v3 Turbo",  "size": "~1.6 GB"},
+    # Parakeet (sherpa-onnx, NVIDIA)
+    "parakeet-ctc-110m":     {"label": "Parakeet CTC 110M",       "size": "~420 MB"},
+    "parakeet-tdt-0.6b-v3":  {"label": "Parakeet TDT 0.6B v3",   "size": "~640 MB"},
     # SenseVoice (sherpa-onnx, Alibaba)
-    "sensevoice-small": {"label": "SenseVoice Small",      "size": "~230 MB"},
+    "sensevoice-small":      {"label": "SenseVoice Small",        "size": "~230 MB"},
 }
 
 
