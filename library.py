@@ -16,6 +16,7 @@ from tkinter import messagebox, simpledialog
 
 import launcher
 import lecture_store as store
+from audio_player import AudioPlayer
 import settings
 import ui
 
@@ -38,7 +39,31 @@ BETTER_MODEL = "large-v3-turbo"
 SEARCH_DELAY_MS = 400
 RESULTS_PAGE = 40
 SIDEBAR_W = 330
+HEADING_HOVER = "#e8e8e8"
+NOW_BG = "#e8f0fe"     # the paragraph that is playing right now
+SPEEDS = (1.0, 1.25, 1.5, 1.75, 2.0)
 READING_W = 760       # max width of the transcript text, for comfortable reading
+
+
+def _course_order(name: str):
+    """M4 before M13 (by number), courses without a code after them."""
+    code, rest = _course_parts(name)
+    digits = re.sub(r"\D", "", code)
+    return (0, int(digits), rest.lower()) if digits else (1, 0, name.lower())
+
+
+def _clickable(frame, command):
+    """Whole row clickable, with a hover shade (Leave also fires over child labels)."""
+    def inside(e):
+        w = frame.winfo_containing(e.x_root, e.y_root)
+        while w is not None and w is not frame:
+            w = w.master
+        return w is frame
+    for w in (frame, *frame.winfo_children()):
+        w.bind("<Button-1>", lambda e: command())
+        w.configure(cursor="hand2")
+    frame.bind("<Enter>", lambda e: ui.set_bg(frame, HEADING_HOVER))
+    frame.bind("<Leave>", lambda e: None if inside(e) else ui.set_bg(frame, ui.BG))
 
 
 def _course_parts(name: str) -> tuple[str, str]:
@@ -78,6 +103,11 @@ class LibraryWindow:
         self.current: str | None = None
         self._jobs: dict[str, object] = {}
         self._search_job = None
+        saved = settings.get("library_open_courses")
+        self._open_courses: set[str] | None = set(saved) if saved is not None else None
+        self.player = AudioPlayer()
+        self._line_secs: dict[int, int] = {}     # transcript line → seconds into the audio
+        self._now_line: int | None = None
 
         self.win = ui.window("Lecture Library", resizable=True)
         px = ui.px
@@ -126,14 +156,31 @@ class LibraryWindow:
 
         self.actions = tk.Frame(read, bg=ui.BG)
         self.actions.pack(fill=tk.X, pady=(px(14), px(14)))
-        self.buttons = [
-            ui.Button(self.actions, "▶  Play audio", self._play, kind="plain"),
-            ui.Button(self.actions, "Open transcript", self._open_transcript, kind="plain"),
-        ]
-        for b in self.buttons:
-            b.pack(side=tk.LEFT, padx=(0, px(8)))
         self.more = ui.Link(self.actions, "More  ▾", self._more, size=10)
-        self.more.pack(side=tk.LEFT, padx=(px(10), 0))
+        self.more.pack(side=tk.RIGHT, padx=(px(16), 0))
+        self.buttons = [ui.Button(self.actions, "Open transcript", self._open_transcript,
+                                  kind="plain")]
+        self.buttons[0].pack(side=tk.RIGHT, padx=(px(8), 0))
+
+        # Player: ▶  12:34 ━━━━●──── 38:44  1×
+        bar = tk.Frame(self.actions, bg=ui.BG_ENTRY, padx=px(10), pady=px(5))
+        bar.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        self.play_btn = tk.Label(bar, text="▶", font=(ui.FONT, 11), fg="#ffffff", bg=ui.ACCENT,
+                                 width=3, cursor="hand2")
+        self.play_btn.pack(side=tk.LEFT)
+        self.play_btn.bind("<Button-1>", lambda e: self._toggle_play())
+        self.play_btn.bind("<Enter>", lambda e: self.play_btn.config(bg=ui.ACCENT_HOVER))
+        self.play_btn.bind("<Leave>", lambda e: self.play_btn.config(bg=ui.ACCENT))
+        self.pos_label = tk.Label(bar, text="0:00", font=(ui.FONT, 9), fg=ui.FG_DIM,
+                                  bg=ui.BG_ENTRY, width=7)
+        self.pos_label.pack(side=tk.LEFT, padx=(px(6), 0))
+        self.speed_link = ui.Link(bar, "1×", self._cycle_speed, bg=ui.BG_ENTRY, size=10)
+        self.speed_link.pack(side=tk.RIGHT, padx=(px(8), px(2)))
+        self.dur_label = tk.Label(bar, text="0:00", font=(ui.FONT, 9), fg=ui.FG_DIM,
+                                  bg=ui.BG_ENTRY, width=7)
+        self.dur_label.pack(side=tk.RIGHT)
+        self.slider = ui.Slider(bar, self._on_seek)
+        self.slider.pack(side=tk.LEFT, fill=tk.X, expand=True)
 
         self.status = tk.Label(read, text="", bg=ui.BG, fg=ui.FG_DIM, font=(ui.FONT, 9),
                                anchor="w")
@@ -156,10 +203,21 @@ class LibraryWindow:
         self.text.tag_configure("warn", foreground=ui.WARN)
         self.text.tag_configure("hit", background=ui.HIGHLIGHT)
         self.text.tag_configure("message", foreground=ui.FG_DIM, justify=tk.CENTER)
+        self.text.tag_configure("now", background=NOW_BG)
+        self.text.tag_lower("now")
+        # Click a timestamp (or a bookmark) to play from there
+        self.text.tag_bind("jump", "<Button-1>", self._on_jump_click)
+        self.text.tag_bind("jump", "<Enter>", lambda e: self.text.config(cursor="hand2"))
+        self.text.tag_bind("jump", "<Leave>", lambda e: self.text.config(cursor="arrow"))
         panes.add(read, minsize=px(420))
 
         self.win.bind("<Control-f>", lambda e: self.search.focus_set())
+        self.win.bind("<space>", lambda e: self._key(self._toggle_play))
+        self.win.bind("<Left>", lambda e: self._key(lambda: self._skip(-10)))
+        self.win.bind("<Right>", lambda e: self._key(lambda: self._skip(10)))
+        self.win.protocol("WM_DELETE_WINDOW", self._close)
         self.refresh()
+        self._tick()
 
     # ─── Data ───────────────────────────────────────────────
 
@@ -174,22 +232,41 @@ class LibraryWindow:
         else:
             self._show_browse()
 
-    def _show_browse(self):
+    def _show_browse(self, keep_scroll: bool = False):
+        courses = [(c, store.list_sessions(c["path"])) for c in self.courses]
+        courses = sorted(((c, s) for c, s in courses if s), key=lambda cs: _course_order(cs[0]["name"]))
+        if self._open_courses is None:
+            # First time: open the course with the most recent lecture
+            newest = max(courses, key=lambda cs: cs[1][0].get("started", ""), default=None)
+            self._open_courses = {newest[0]["name"]} if newest else set()
         self.rows = []
-        for c in self.courses:
-            sessions = store.list_sessions(c["path"])
-            if sessions:
-                self.rows.append({"type": "course", **c})
+        for c, sessions in courses:
+            is_open = c["name"] in self._open_courses
+            self.rows.append({"type": "course", **c, "count": len(sessions), "open": is_open})
+            if is_open:
                 self.rows += [{"type": "session", **s} for s in sessions]
+
+        y = self.list.canvas.yview()[0]
         self._set_caption("")
         self.list.set_items(self.rows, empty_text="No lectures yet")
         if not self.rows:
             self._show_message("No lectures yet.\n\nStart one from the tray icon:\n"
                                "right-click → Start lecture…")
             return
+        if keep_scroll:
+            self.win.update_idletasks()
+            self.list.canvas.yview_moveto(y)
         idx = next((i for i, r in enumerate(self.rows)
-                    if r["type"] == "session" and r["path"] == self.current), self.list.first())
-        self.list.select(idx)
+                    if r["type"] == "session" and r["path"] == self.current), None)
+        if idx is not None:
+            self.list.select(idx, notify=not keep_scroll, scroll=not keep_scroll)
+        elif self.current is None and self.list.first() is not None:
+            self.list.select(self.list.first())
+
+    def _toggle_course(self, name: str):
+        self._open_courses ^= {name}
+        settings.put("library_open_courses", sorted(self._open_courses))
+        self._show_browse(keep_scroll=True)
 
     def _set_caption(self, text: str):
         if text:
@@ -204,14 +281,19 @@ class LibraryWindow:
         px = ui.px
         if row["type"] == "course":
             code, rest = _course_parts(row["name"])
-            frame.config(padx=px(14), pady=px(6))
-            frame.pack_configure(pady=(px(12), px(2)))
+            frame.config(padx=px(8), pady=px(8), cursor="hand2")
+            frame.pack_configure(pady=(px(2), px(2) if row["open"] else 0))
+            tk.Label(frame, text="▾" if row["open"] else "▸", font=(ui.FONT, 10), fg=ui.FG_DIM,
+                     width=2, anchor="w").pack(side=tk.LEFT, anchor="n")
             if code:
-                tk.Label(frame, text=code, font=(ui.FONT, 9, "bold"), fg=ui.FG, anchor="w"
+                tk.Label(frame, text=code, font=(ui.FONT, 10, "bold"), fg=ui.FG, anchor="w"
                          ).pack(side=tk.LEFT, anchor="n")
+            tk.Label(frame, text=str(row["count"]), font=(ui.FONT, 9), fg=ui.FG_DIM
+                     ).pack(side=tk.RIGHT, anchor="n", padx=(px(8), px(6)))
             tk.Label(frame, text=rest, font=(ui.FONT, 9), fg=ui.FG_DIM, anchor="w",
-                     justify=tk.LEFT, wraplength=px(SIDEBAR_W - 110)
-                     ).pack(side=tk.LEFT, padx=(px(6) if code else 0, 0), fill=tk.X)
+                     justify=tk.LEFT, wraplength=px(SIDEBAR_W - 150)
+                     ).pack(side=tk.LEFT, padx=(px(6) if code else 0, 0), fill=tk.X, pady=(px(1), 0))
+            _clickable(frame, lambda: self._toggle_course(row["name"]))
             return
         if row["type"] == "hit":
             info = f"{_short_course(row['course'])}  ·  {row['title']}  ·  {row['timestamp']}"
@@ -254,6 +336,7 @@ class LibraryWindow:
             self.actions.pack_forget()
 
     def _show_message(self, text: str):
+        self._reset_player(0)
         self.current = None
         self.title.config(text="")
         self.meta.config(text="")
@@ -269,8 +352,10 @@ class LibraryWindow:
         self.text.configure(state=tk.DISABLED)
 
     def _show_session(self, path: str, jump_line: int | None = None, highlight: str = ""):
-        self.current = path
         meta = store.load_meta(path)
+        if path != self.current or not self.player.loaded:
+            self._reset_player(meta.get("duration_s", 0))
+        self.current = path
         self._enable_actions(True)
 
         self.title.config(text=meta.get("title", ""))
@@ -309,6 +394,7 @@ class LibraryWindow:
 
         parts = []
         line_map = {}   # md line number → text widget line
+        self._line_secs = {}
         widget_line = 1
         for n in range(body_start, len(lines)):
             line = lines[n]
@@ -318,13 +404,14 @@ class LibraryWindow:
             m = _TS_LINE.match(line)
             if m:
                 prefix, ts, text = m.groups()
+                self._line_secs[widget_line] = store.parse_ts(ts)
                 ts = ts[3:] if ts.startswith("00:") else ts     # 00:12:34 → 12:34
                 if prefix and "🔖" in prefix:
-                    parts.append((f"★ {ts}  {text}\n", ("bookmark",)))
+                    parts.append((f"★ {ts}  {text}\n", ("bookmark", "jump")))
                 elif prefix:
                     parts.append((f"⚠ {ts}  {text}\n", ("warn",)))
                 else:
-                    parts.append((f"{ts}    ", ("ts",)))
+                    parts.append((f"{ts}    ", ("ts", "jump")))
                     parts.append((text + "\n", ()))
             else:
                 parts.append((line + "\n", ()))
@@ -403,12 +490,110 @@ class LibraryWindow:
 
     # ─── Actions ────────────────────────────────────────────
 
-    def _play(self):
+    # ─── Audio player ───────────────────────────────────────
+
+    def _reset_player(self, duration_s: float):
+        """New lecture selected: stop, and show its length (the file opens on first play)."""
+        self.player.close()
+        self._set_now_line(None)
+        self.play_btn.config(text="▶")
+        self.slider.set(0)
+        self.pos_label.config(text="0:00")
+        self.dur_label.config(text=store.format_duration(duration_s))
+
+    def _ensure_loaded(self) -> bool:
+        if self.player.loaded:
+            return True
         audio = store.find_audio(self.current) if self.current else None
-        if audio:
-            launcher.open_path(audio)
-        else:
+        if not audio:
             self.status.config(text="No audio file in this lecture.")
+            return False
+        if not AudioPlayer.available:
+            launcher.open_path(audio)          # no built-in player on this system
+            return False
+        try:
+            self.player.load(audio)
+        except OSError as e:
+            self.status.config(text=f"Can't play this audio here ({e}) — opening it in your audio app.")
+            launcher.open_path(audio)
+            return False
+        self.dur_label.config(text=store.format_duration(self.player.duration_ms / 1000))
+        return True
+
+    def _toggle_play(self):
+        if not self._ensure_loaded():
+            return
+        if self.player.playing:
+            self.player.pause()
+        else:
+            self.player.play()
+        self._update_player()
+
+    def _play_from(self, seconds: float):
+        if self._ensure_loaded():
+            self.player.play(int(seconds * 1000))
+            self._update_player()
+
+    def _skip(self, seconds: float):
+        if self.player.loaded:
+            self.player.seek(self.player.position_ms() + int(seconds * 1000))
+            self._update_player()
+
+    def _on_seek(self, fraction: float):
+        if self._ensure_loaded():
+            self.player.seek(int(fraction * self.player.duration_ms))
+            self._update_player()
+
+    def _cycle_speed(self):
+        speed = SPEEDS[(SPEEDS.index(self.player.speed) + 1) % len(SPEEDS)] \
+            if self.player.speed in SPEEDS else 1.0
+        self.player.set_speed(speed)
+        self.speed_link.config(text=f"{speed:g}×")
+
+    def _on_jump_click(self, event):
+        line = int(self.text.index(f"@{event.x},{event.y}").split(".")[0])
+        if line in self._line_secs:
+            self._play_from(self._line_secs[line])
+
+    def _key(self, action):
+        """Space / ← / → control playback, unless you're typing in a field."""
+        if isinstance(self.win.focus_get(), tk.Entry):
+            return None
+        action()
+        return "break"
+
+    def _update_player(self):
+        if not self.player.loaded:
+            return
+        pos = self.player.position_ms()
+        self.play_btn.config(text="❚❚" if self.player.playing else "▶")
+        self.pos_label.config(text=store.format_duration(pos / 1000))
+        self.slider.set(pos / max(1, self.player.duration_ms))
+        # Shade the paragraph that's playing
+        secs = pos / 1000
+        line = max((ln for ln, s in self._line_secs.items() if s <= secs), default=None,
+                   key=lambda ln: self._line_secs[ln])
+        self._set_now_line(line)
+
+    def _set_now_line(self, line: int | None):
+        if line == self._now_line:
+            return
+        self.text.tag_remove("now", "1.0", tk.END)
+        if line is not None:
+            self.text.tag_add("now", f"{line}.0", f"{line}.end+1c")
+        self._now_line = line
+
+    def _tick(self):
+        try:
+            if self.player.loaded:
+                self._update_player()
+        except OSError:
+            pass
+        self.win.after(250, self._tick)
+
+    def _close(self):
+        self.player.close()
+        self.win.destroy()
 
     def _open_transcript(self):
         if self.current:
@@ -510,6 +695,7 @@ class LibraryWindow:
                                        parent=self.win)
         if title and title.strip():
             try:
+                self._reset_player(meta.get("duration_s", 0))   # Windows locks open files
                 self.current = store.rename_session(self.current, title)
             except OSError as e:
                 messagebox.showerror("Rename failed", str(e), parent=self.win)
@@ -524,6 +710,7 @@ class LibraryWindow:
         if not self.current or course == store.load_meta(self.current).get("course"):
             return
         try:
+            self.player.close()                          # Windows locks open files
             self.current = store.move_session(self.current, self.root_dir, course)
         except OSError as e:
             messagebox.showerror("Move failed", str(e), parent=self.win)
