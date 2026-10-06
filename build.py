@@ -43,6 +43,7 @@ HIDDEN_IMPORTS = [
     "lecture_dialog",
     "library",
     "calendar_setup",
+    "ui",
     "tkinter.filedialog",
     "lameenc",
 ]

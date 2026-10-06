@@ -11,17 +11,11 @@ import argparse
 import json
 import sys
 import tkinter as tk
-from tkinter import ttk
 
 import course_calendar
 import lecture_store as store
 import settings
-
-BG = "#f3f3f3"
-FG = "#1a1a1a"
-FG_DIM = "#666666"
-ACCENT = "#4a80c4"
-CAL_BG = "#e8f0fe"
+import ui
 
 
 def _lang_label(code: str) -> str:
@@ -47,67 +41,70 @@ class LectureDialog:
         cal = course_calendar.CourseCalendar(url=s.get("calendar_url", ""))
         self.event = cal.current() if cal.available else None
 
-        self.win = tk.Tk()
-        self.win.title("Start lecture")
-        self.win.configure(bg=BG, padx=20, pady=16)
-        self.win.resizable(False, False)
+        self.win = ui.window("Start lecture")
+        self.win.configure(padx=24, pady=20)
         self.win.attributes("-topmost", True)
+        self.win.columnconfigure(0, weight=1)
 
-        row = 0
+        ui.heading(self.win, "Start lecture").grid(row=0, column=0, sticky="w", pady=(0, 14))
+        row = 1
+
         self.use_cal = tk.BooleanVar(value=self.event is not None)
         if self.event:
             ev = self.event
-            box = tk.Frame(self.win, bg=CAL_BG, padx=12, pady=8)
-            box.grid(row=row, column=0, columnspan=2, sticky="ew", pady=(0, 12))
-            tk.Label(box, text=f"On your timetable now  ·  {ev.start:%H:%M}–{ev.end:%H:%M}  ·  {ev.kind}",
-                     font=("Segoe UI", 10, "bold"), bg=CAL_BG, fg=FG,
+            box = tk.Frame(self.win, bg=ui.BG_ENTRY)
+            box.grid(row=row, column=0, sticky="ew", pady=(0, 16))
+            tk.Frame(box, bg=ui.ACCENT, width=3).pack(side=tk.LEFT, fill=tk.Y)
+            body = tk.Frame(box, bg=ui.BG_ENTRY, padx=14, pady=10)
+            body.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+            meta = "  ·  ".join(x for x in ("Now on your timetable",f"{ev.start:%H:%M}–{ev.end:%H:%M}",
+                                            ev.kind) if x)
+            tk.Label(body, text=meta, font=(ui.FONT, 9), fg=ui.ACCENT, bg=ui.BG_ENTRY,
                      anchor="w").pack(fill=tk.X)
-            tk.Label(box, text=ev.course, font=("Segoe UI", 10), bg=CAL_BG, fg=FG,
-                     anchor="w", wraplength=420, justify=tk.LEFT).pack(fill=tk.X)
+            tk.Label(body, text=ev.course, font=(ui.FONT, 10, "bold"), fg=ui.FG, bg=ui.BG_ENTRY,
+                     anchor="w", wraplength=400, justify=tk.LEFT).pack(fill=tk.X, pady=(2, 0))
             details = "  ·  ".join(x for x in (ev.room, ev.lecturer) if x)
             if details:
-                tk.Label(box, text=details, font=("Segoe UI", 9), bg=CAL_BG, fg=FG_DIM,
-                         anchor="w").pack(fill=tk.X)
-            tk.Checkbutton(box, text="Use calendar info", variable=self.use_cal,
-                           bg=CAL_BG, activebackground=CAL_BG,
-                           command=self._apply_defaults).pack(anchor="w", pady=(4, 0))
+                tk.Label(body, text=details, font=(ui.FONT, 9), fg=ui.FG_DIM, bg=ui.BG_ENTRY,
+                         anchor="w", wraplength=400, justify=tk.LEFT).pack(fill=tk.X)
+            ui.Check(body, "Fill in from timetable", self.use_cal, command=self._apply_defaults,
+                     bg=ui.BG_ENTRY).pack(anchor="w", pady=(6, 0))
             row += 1
 
-        def label(text, r):
-            tk.Label(self.win, text=text, bg=BG, fg=FG_DIM,
-                     font=("Segoe UI", 9)).grid(row=r, column=0, sticky="w", pady=4, padx=(0, 12))
+        def label(text):
+            nonlocal row
+            ui.caption(self.win, text).grid(row=row, column=0, sticky="w", pady=(0, 3))
+            row += 1
 
-        label("Course", row)
+        label("Course")
         course_names = sorted(self.courses)
         if self.event and self.event.course not in self.courses:
             course_names.insert(0, self.event.course)
         self.course_var = tk.StringVar()
-        self.course_box = ttk.Combobox(self.win, textvariable=self.course_var,
-                                       values=course_names, width=52)
-        self.course_box.grid(row=row, column=1, sticky="ew", pady=4)
-        self.course_box.bind("<<ComboboxSelected>>", lambda e: self._on_course_change())
-        self.course_box.bind("<FocusOut>", lambda e: self._on_course_change())
+        self.course_box = ui.ComboField(self.win, self.course_var, values=course_names,
+                                        on_pick=self._on_course_change, width=48)
+        self.course_box.grid(row=row, column=0, sticky="ew", pady=(0, 12))
+        self.course_box.entry.bind("<FocusOut>", lambda e: self._on_course_change(), add="+")
         row += 1
 
-        label("Title", row)
+        label("Title")
         self.title_var = tk.StringVar()
-        self.title_entry = ttk.Entry(self.win, textvariable=self.title_var, width=54)
-        self.title_entry.grid(row=row, column=1, sticky="ew", pady=4)
+        title = ui.Field(self.win, self.title_var, width=48)
+        title.grid(row=row, column=0, sticky="ew", pady=(0, 12))
+        self.title_entry = title.entry
         self.title_entry.bind("<Key>", lambda e: setattr(self, "_title_edited", True))
         row += 1
 
-        label("Language", row)
+        label("Language")
         self.lang_var = tk.StringVar()
-        ttk.Combobox(self.win, textvariable=self.lang_var, state="readonly",
-                     values=list(store.LANGUAGES.values()), width=20
-                     ).grid(row=row, column=1, sticky="w", pady=4)
+        ui.Segmented(self.win, list(store.LANGUAGES.values()), self.lang_var
+                     ).grid(row=row, column=0, sticky="w")
         row += 1
 
-        buttons = tk.Frame(self.win, bg=BG)
-        buttons.grid(row=row, column=0, columnspan=2, sticky="e", pady=(14, 0))
-        ttk.Button(buttons, text="Cancel", command=self._cancel).pack(side=tk.RIGHT)
-        start = ttk.Button(buttons, text="● Start recording", command=self._start)
-        start.pack(side=tk.RIGHT, padx=(0, 8))
+        buttons = tk.Frame(self.win, bg=ui.BG)
+        buttons.grid(row=row, column=0, sticky="e", pady=(22, 0))
+        ui.Button(buttons, "●  Start recording", self._start, kind="record").pack(side=tk.RIGHT)
+        ui.Link(buttons, "Cancel", self._cancel, size=10).pack(side=tk.RIGHT, padx=(0, 18))
 
         self.win.bind("<Return>", lambda e: self._start())
         self.win.bind("<Escape>", lambda e: self._cancel())
@@ -117,12 +114,8 @@ class LectureDialog:
         self._last_course = None
         self._apply_defaults(initial=True)
 
-        self.win.update_idletasks()
-        w, h = self.win.winfo_width(), self.win.winfo_height()
-        x = (self.win.winfo_screenwidth() - w) // 2
-        y = (self.win.winfo_screenheight() - h) // 3
-        self.win.geometry(f"+{x}+{y}")
-        self.win.after(50, lambda: (self.win.focus_force(), start.focus_set()))
+        ui.center(self.win)
+        self.win.after(50, self.win.focus_force)
 
     # ─── Defaults ───────────────────────────────────────────
 
@@ -157,7 +150,7 @@ class LectureDialog:
     def _start(self):
         course = self.course_var.get().strip()
         if not course:
-            self.course_box.focus_set()
+            self.course_box.entry.focus_set()
             return
         use_event = self.event is not None and self.use_cal.get() and course == self.event.course
         self.result = {
