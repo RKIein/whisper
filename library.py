@@ -274,14 +274,16 @@ class LibraryWindow:
         self._enable_actions(True)
 
         self.title.config(text=meta.get("title", ""))
-        bits = [meta.get("course", ""), _date(meta.get("started", ""), with_time=True)]
+        bits = [_date(meta.get("started", ""), with_time=True)]
         if meta.get("duration_s"):
             bits.append(_minutes(meta["duration_s"]))
         bits += [meta[k] for k in ("lecturer", "room") if meta.get(k)]
         if meta.get("bookmarks"):
             n = len(meta["bookmarks"])
             bits.append(f"★ {n} bookmark{'s' if n != 1 else ''}")
-        self.meta.config(text="  ·  ".join(b for b in bits if b))
+        # Course on its own line; no line breaks inside a name or room
+        details = "  ·  ".join(b.replace(" ", " ") for b in bits if b)
+        self.meta.config(text="\n".join(x for x in (meta.get("course", ""), details) if x))
 
         notice, color = "", ui.FG_DIM
         status = meta.get("status", "")
