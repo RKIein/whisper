@@ -194,6 +194,10 @@ class TrayIcon:
             if self._icon is not None:
                 self._icon.icon = _create_icon_image(state=state)
                 self._icon.title = STATE_TITLES.get(state, STATE_TITLES[STATE_IDLE])
+                # On Windows pystray only rebuilds the menu on update_menu(),
+                # so items that depend on the state (lecture controls,
+                # Start/Stop recording) must be refreshed here.
+                self._icon.update_menu()
                 logger.debug(f"Tray state: {state}")
         except Exception:
             pass
