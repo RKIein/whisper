@@ -159,6 +159,8 @@ class TrayIcon:
         self.lecture_root = ""
         self.quick_start_label = None         # callable → str | None
         self._lecture_model = "small"
+        self.lecture_live = True                   # transcribe during the lecture
+        self.on_lecture_live_change = None         # (bool)
         self._state = STATE_IDLE
         self._current_model = "base.en"
         self._hotkey_mode = "toggle"
@@ -226,6 +228,10 @@ class TrayIcon:
 
     def set_lecture_model(self, model_id: str):
         self._lecture_model = model_id
+
+    def _toggle_lecture_live(self):
+        self.lecture_live = not self.lecture_live
+        self._call(self.on_lecture_live_change, self.lecture_live)
 
     def refresh_menu(self):
         try:
@@ -306,6 +312,11 @@ class TrayIcon:
             pystray.MenuItem(
                 "Lecture settings",
                 pystray.Menu(
+                    pystray.MenuItem(
+                        "Live transcript during lecture",
+                        lambda icon, item: self._toggle_lecture_live(),
+                        checked=lambda _: self.lecture_live,
+                    ),
                     pystray.MenuItem(
                         "Model",
                         pystray.Menu(*self._build_lecture_model_menu()),

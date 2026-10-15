@@ -12,8 +12,9 @@ import re
 import sys
 import tkinter as tk
 from datetime import datetime
-from tkinter import messagebox, simpledialog
+from tkinter import filedialog, messagebox, simpledialog
 
+import colab_exchange
 import launcher
 import lecture_store as store
 from audio_player import AudioPlayer
@@ -25,6 +26,7 @@ STATUS_MARKS = {
     store.STATUS_FINISHING: ("…", ui.BOOKMARK),
     store.STATUS_COMPLETE: ("✓", ui.OK),
     store.STATUS_INCOMPLETE: ("⚠", ui.WARN),
+    store.STATUS_AUDIO_ONLY: ("♪", ui.FG_DIM),
 }
 
 # Tk 8.6 can crash on characters outside the BMP (emoji) in Text.search
@@ -136,6 +138,11 @@ class LibraryWindow:
 
         foot = tk.Frame(side, bg=ui.BG, padx=px(18), pady=px(12))
         foot.pack(side=tk.BOTTOM, fill=tk.X)
+        colab = tk.Frame(foot, bg=ui.BG)
+        colab.pack(fill=tk.X, pady=(0, px(6)))
+        ui.Link(colab, "Send to Colab…", self._send_to_colab).pack(side=tk.LEFT)
+        ui.Link(colab, "Import from Colab…", self._import_from_colab
+                ).pack(side=tk.LEFT, padx=(px(16), 0))
         ui.Link(foot, "Open lectures folder", lambda: launcher.open_path(self._ensure_root())
                 ).pack(side=tk.LEFT)
         ui.Link(foot, "Refresh", self.refresh).pack(side=tk.LEFT, padx=(px(16), 0))
@@ -375,6 +382,9 @@ class LibraryWindow:
         if status == store.STATUS_INCOMPLETE:
             notice, color = (f"⚠ {meta.get('failed_chunks', 0)} part(s) could not be "
                              "transcribed — More ▾ → Transcribe again"), ui.WARN
+        elif status == store.STATUS_AUDIO_ONLY:
+            notice = ("♪ Recorded without live transcript — send it to Colab (bottom left), "
+                      "or More ▾ → Improve transcript")
         elif status in (store.STATUS_RECORDING, store.STATUS_FINISHING):
             done = store.format_duration(meta.get("transcribed_until_s", 0))
             notice, color = f"{STATUS_MARKS[status][0]} Still transcribing — text up to {done}", ui.BOOKMARK
@@ -489,6 +499,56 @@ class LibraryWindow:
         self._show_browse()
 
     # ─── Actions ────────────────────────────────────────────
+
+    # ─── Colab ──────────────────────────────────────────────
+
+    def _send_to_colab(self):
+        """Pack every lecture Colab hasn't transcribed yet into one zip for upload."""
+        n = len(colab_exchange.pending_sessions(self.root_dir))
+        if n == 0:
+            messagebox.showinfo("Send to Colab", "Every lecture here has already been "
+                                "transcribed in Colab.", parent=self.win)
+            return
+        downloads = os.path.join(os.path.expanduser("~"), "Downloads")
+        dest = os.path.join(downloads, f"Colab-Upload-{datetime.now():%Y-%m-%d-%H%M}.zip")
+        self.status.config(text=f"Packing {n} lecture(s)…")
+        self.win.update_idletasks()
+        try:
+            n = colab_exchange.export_for_colab(self.root_dir, dest)
+        except OSError as e:
+            messagebox.showerror("Send to Colab", f"Could not create the zip:\n{e}", parent=self.win)
+            return
+        size = os.path.getsize(dest) / 1e6
+        self.status.config(text=f"{n} lecture(s) packed → {os.path.basename(dest)} ({size:.0f} MB)")
+        launcher.reveal(dest)
+        messagebox.showinfo(
+            "Send to Colab",
+            f"{n} lecture(s) are packed into\n{os.path.basename(dest)}  ({size:.0f} MB),\n"
+            "shown in your Downloads folder.\n\n"
+            "Upload it to Google Drive → Vorlesungen → Inbox, together with any iPad "
+            "recordings, then run the Colab notebook.", parent=self.win)
+
+    def _import_from_colab(self):
+        path = filedialog.askopenfilename(
+            parent=self.win, title="Choose the Transkripte zip from Colab",
+            initialdir=os.path.join(os.path.expanduser("~"), "Downloads"),
+            filetypes=[("Colab results", "*.zip"), ("All files", "*.*")])
+        if not path:
+            return
+        self.player.close()                       # Windows locks open audio files
+        try:
+            new, updated = colab_exchange.import_results(self._ensure_root(), path)
+        except Exception as e:
+            messagebox.showerror("Import from Colab", f"Could not import that file:\n{e}",
+                                 parent=self.win)
+            return
+        self.courses = store.list_courses(self.root_dir)
+        self._open_courses = None                 # reopen where the newest lecture is
+        self.refresh()
+        if self.current:
+            self._show_session(self.current)
+        self.status.config(text=f"Imported from Colab: {updated} transcript(s) updated, "
+                                f"{new} new lecture(s).")
 
     # ─── Audio player ───────────────────────────────────────
 

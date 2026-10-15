@@ -170,6 +170,8 @@ class WhisperDictationApp:
         self.tray.lecture_root = self._lecture_root
         self.tray.quick_start_label = self._quick_start_label
         self.tray.set_lecture_model(self._settings.get("lecture_model", "small"))
+        self.tray.lecture_live = self._settings.get("lecture_live_transcript", True)
+        self.tray.on_lecture_live_change = lambda on: settings.put("lecture_live_transcript", on)
 
         self.hotkeys.start()
         self.tray.run(setup=self._on_tray_ready)
@@ -448,15 +450,19 @@ class WhisperDictationApp:
 
         def _start():
             try:
-                model_id = settings.get("lecture_model", "small")
-                if self.lecture_transcriber is None or self.lecture_transcriber.model_id != model_id:
-                    self.lecture_transcriber = Transcriber(model_id)
-                self.lecture_transcriber.load(
-                    on_progress=lambda m: self.tray.set_title(f"Lecture — {m}")
-                )
+                live = settings.get("lecture_live_transcript", True)
+                if live:
+                    model_id = settings.get("lecture_model", "small")
+                    if self.lecture_transcriber is None or self.lecture_transcriber.model_id != model_id:
+                        self.lecture_transcriber = Transcriber(model_id)
+                    self.lecture_transcriber.load(
+                        on_progress=lambda m: self.tray.set_title(f"Lecture — {m}")
+                    )
                 lecture_store.ensure_course(self._lecture_root, course, language)
 
-                session = LectureSession(self.lecture_transcriber, self._lecture_root)
+                # Without live transcript: record only, transcribe later (Colab / Improve)
+                session = LectureSession(self.lecture_transcriber if live else None,
+                                         self._lecture_root)
                 session.on_state_change = self._on_lecture_state
                 session.on_title_update = lambda t: self.tray.set_title(t)
                 session.on_finished = self._on_lecture_finished

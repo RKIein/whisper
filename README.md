@@ -129,6 +129,27 @@ Tray → Lecture settings → Model. Lecture mode uses multilingual Whisper mode
 
 Pick the lecture’s language (Deutsch / English) for each course — it’s remembered. *Auto-detect* also works, but a fixed language is more reliable for lectures full of technical terms.
 
+**Live transcript on/off:** Tray → Lecture settings → *Live transcript during lecture*. When it's off, the app only records (♪ in the library). That saves battery and CPU, and you transcribe later, either with *More ▾ → Improve transcript* or in batches on Google Colab.
+
+### Batch transcription on Google Colab
+
+Transcribe a whole stack of recordings at once on Google's GPU, with the most accurate Whisper model (`large-v3`, roughly 2–4 min per 90-min lecture). Each one is sorted into its course using your timetable, and you get one readable text transcript per lecture.
+
+[**Open the notebook in Colab**](https://colab.research.google.com/github/RKIein/whisper/blob/master/colab/Lecture_Transcriber.ipynb)
+
+1. **Once:** in Google Drive, create `Vorlesungen/Inbox` and put your TraiNex `.ics` into `Vorlesungen`.
+2. **Upload** into `Vorlesungen/Inbox`. You can mix:
+   - *Lecture library → Send to Colab…*, which packs every lecture not yet transcribed in Colab into one zip in your Downloads
+   - GoodNotes recordings: exported `.mp3` files, or whole `.goodnotes` documents
+   - any other audio files
+3. **Run:** in the notebook, *Runtime → Run all*. If you get disconnected, run it again; finished files are skipped.
+4. **Results:** you get `Transkripte-<date>.zip`, which contains `Transcripts/<course>/<date> – <title>.txt` plus `Overview.txt`, the list of what went where.
+5. **Optional:** *Lecture library → Import from Colab…* files the transcripts into the app. Lectures recorded with the app get the better transcript (your titles and bookmarks stay); iPad lectures are added as new lectures.
+
+Recordings are matched by their recording time: from the app, from the audio file's own metadata, from the GoodNotes file date, or from a date in the file name (e.g. `2026-10-06 at 13.52`). Anything that can't be matched goes to `Unsorted`.
+
+> This uploads recordings to Google. Skip sessions where patient cases are discussed.
+
 ### If something goes wrong
 
 The audio is written to disk continuously. If the app or laptop crashes mid-lecture, the recording up to that moment is kept; on the next start you get a notification, and **Lecture library → Transcribe again** finishes the transcript. You can also run it by hand:
@@ -206,7 +227,7 @@ Change `HOTKEY_TOGGLE_DICTATION` in `config.py` to a different combo.
 
 ## Privacy
 
-Everything runs locally. No audio, text, or data of any kind is sent anywhere. The only optional exception is downloading your timetable, if you set a calendar subscription URL. The mic is only active while the green icon is showing.
+Everything runs locally. No audio, text, or data of any kind is sent anywhere. There are two optional exceptions: downloading your timetable, if you set a calendar subscription URL, and the Colab batch transcription, which only sends recordings you upload yourself. The mic is only active while the green icon is showing.
 
 ---
 
