@@ -39,6 +39,7 @@ STATUS_RECORDING = "recording"
 STATUS_FINISHING = "finishing"
 STATUS_COMPLETE = "complete"
 STATUS_INCOMPLETE = "incomplete"   # finished, but some chunks failed to transcribe
+STATUS_AUDIO_ONLY = "audio_only"   # recorded without live transcript — transcribe later
 
 LANGUAGES = {
     "auto": "Auto-detect",

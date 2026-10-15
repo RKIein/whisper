@@ -52,6 +52,17 @@ def run(tool: str, *args: str, timeout: float | None = None) -> int:
         return -1
 
 
+def reveal(path: str):
+    """Show a file selected in Explorer (or open its folder elsewhere)."""
+    try:
+        if sys.platform == "win32":
+            subprocess.Popen(["explorer", "/select,", os.path.normpath(path)])
+        else:
+            open_path(os.path.dirname(path))
+    except Exception as e:
+        logger.error(f"Could not show {path}: {e}")
+
+
 def open_path(path: str):
     """Open a file or folder with the system's default app."""
     try:

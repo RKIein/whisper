@@ -76,6 +76,7 @@ class LectureSession:
     """
 
     def __init__(self, transcriber, root: str):
+        """transcriber=None records audio only (transcribe later, e.g. in Colab)."""
         self.transcriber = transcriber
         self.root = root
         self.sample_rate = config.SAMPLE_RATE
@@ -322,7 +323,7 @@ class LectureSession:
 
     def _transcribe_chunk(self, offset_s: float, audio: np.ndarray):
         duration = len(audio) / self.sample_rate
-        if duration < config.MIN_SPEECH_DURATION_S:
+        if duration < config.MIN_SPEECH_DURATION_S or self.transcriber is None:
             return
         try:
             segments, detected = self.transcriber.transcribe_segments(
@@ -362,8 +363,12 @@ class LectureSession:
             with self._meta_lock:
                 self.meta["duration_s"] = round(self.recorded_s, 1)
                 self.meta["transcribed_until_s"] = self.meta["duration_s"]
-                self.meta["status"] = (store.STATUS_INCOMPLETE if self.meta.get("failed_chunks")
-                                       else store.STATUS_COMPLETE)
+                if self.transcriber is None:
+                    self.meta["status"] = store.STATUS_AUDIO_ONLY
+                    self.meta["transcribed_until_s"] = 0.0
+                else:
+                    self.meta["status"] = (store.STATUS_INCOMPLETE if self.meta.get("failed_chunks")
+                                           else store.STATUS_COMPLETE)
                 self._save_meta()
             store.rewrite_front_matter(self.session_dir, self.meta)
 

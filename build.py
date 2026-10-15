@@ -45,6 +45,7 @@ HIDDEN_IMPORTS = [
     "calendar_setup",
     "ui",
     "audio_player",
+    "colab_exchange",
     "tkinter.filedialog",
     "lameenc",
 ]
