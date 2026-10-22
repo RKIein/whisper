@@ -72,14 +72,10 @@ def loudness(audio, step_s: int = 60) -> list[float]:
     return out
 
 
-def louder(audio, target_db: float = -23.0, max_gain_db: float = 30.0):
-    """Quiet recordings (M13 sits at about -49 dBFS) up to normal speech level, no clipping."""
-    import numpy as np
-    rms = float(np.sqrt(np.mean(audio.astype("float64") ** 2))) if len(audio) else 0.0
-    if rms <= 0:
-        return audio
-    gain = 10 ** (min(target_db - 20 * np.log10(rms), max_gain_db) / 20)
-    return np.clip(audio * gain, -1.0, 1.0).astype("float32")
+def louder(audio):
+    """Quiet recordings up to normal speech level (what the Lecture Transcriber now does)."""
+    from lecture_store import normalize_loudness
+    return normalize_loudness(audio)
 
 
 def _read_wav(path: str):
@@ -126,17 +122,30 @@ def prepare(drive_root: str, clips: list[dict], out_dir: str, log=print) -> list
 # ─── Running the models ──────────────────────────────────────
 
 def _venv_python(name: str, packages: list[str], log) -> str:
-    """A venv on top of Colab's packages (torch etc. shared), with `packages` overriding."""
+    """
+    A venv on top of Colab's packages, with `packages` overriding. pip (not uv) so Colab's
+    torch counts as installed, and torch/torchvision/torchaudio are pinned to Colab's:
+    round 2 failed because uv put a second torch into the venv that didn't match
+    Colab's torchvision ("operator torchvision::nms does not exist").
+    """
+    from importlib import metadata
     root = f"/content/venvs/{name}"
     py = f"{root}/bin/python"
     if not os.path.exists(py):
         log(f"   setting up {name} environment (a few minutes)…")
-        subprocess.run([sys.executable, "-m", "pip", "install", "-q", "uv"], check=True)
-        for cmd in (["uv", "venv", "-q", "--system-site-packages", root],
-                    ["uv", "pip", "install", "-q", "--python", py, *packages]):
+        pins = os.path.join("/content/venvs", "torch-pins.txt")
+        os.makedirs("/content/venvs", exist_ok=True)
+        with open(pins, "w") as f:
+            for dist in ("torch", "torchvision", "torchaudio"):
+                try:
+                    f.write(f"{dist}=={metadata.version(dist)}\n")
+                except metadata.PackageNotFoundError:
+                    pass
+        for cmd in ([sys.executable, "-m", "venv", "--system-site-packages", root],
+                    [py, "-m", "pip", "install", "-q", "-c", pins, *packages]):
             r = subprocess.run(cmd, capture_output=True, text=True)
             if r.returncode != 0:
-                raise RuntimeError(f"{' '.join(cmd[:3])} failed:\n{(r.stdout + r.stderr)[-3000:]}")
+                raise RuntimeError(f"{' '.join(cmd[:4])} failed:\n{(r.stdout + r.stderr)[-3000:]}")
     return py
 
 

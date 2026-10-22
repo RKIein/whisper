@@ -653,6 +653,21 @@ def decode_audio(path: str, sample_rate: int = 16000) -> np.ndarray:
     return np.concatenate(chunks).astype(np.float32) / 32768.0
 
 
+def normalize_loudness(audio: np.ndarray, target_db: float = -23.0,
+                       max_gain_db: float = 30.0) -> np.ndarray:
+    """
+    Quiet recordings up to normal speech level. GoodNotes recordings of a distant lecturer
+    sit around -49 dBFS; there the speech detector dropped 20–30 % of the speech, and a
+    whole lecture lost its last 42 minutes after a loud noise. Turned up, all of it came
+    back (measured on Robin's recordings, model comparison 22.10.2026).
+    """
+    rms = float(np.sqrt(np.mean(audio.astype(np.float64) ** 2))) if len(audio) else 0.0
+    if rms <= 0:
+        return audio
+    gain = 10 ** (min(target_db - 20 * np.log10(rms), max_gain_db) / 20)
+    return np.clip(audio * gain, -1.0, 1.0).astype(np.float32)
+
+
 def read_wav(path: str) -> tuple[np.ndarray, int]:
     """Read a 16-bit mono WAV → (float32 audio, sample_rate)."""
     import wave

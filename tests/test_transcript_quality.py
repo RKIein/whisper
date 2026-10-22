@@ -45,3 +45,15 @@ def test_context_prompt():
         == "Seminar: M13 Multivariate Verfahren."
     assert lecture.context_prompt({"course": "Statistik"}) == "Statistik."
     assert lecture.context_prompt({}) is None
+
+
+def test_quiet_recordings_are_turned_up():
+    import numpy as np
+    from lecture_store import normalize_loudness
+    quiet = (np.random.default_rng(0).standard_normal(16000) * 0.0035).astype(np.float32)   # ≈ -49 dBFS
+    loud = normalize_loudness(quiet)
+    db = lambda a: 20 * np.log10(np.sqrt(np.mean(a.astype(np.float64) ** 2)))   # noqa: E731
+    assert round(db(quiet)) == -49 and round(db(loud)) == -23
+    assert np.abs(loud).max() <= 1.0 and loud.dtype == np.float32
+    silence = np.zeros(100, dtype=np.float32)
+    assert normalize_loudness(silence) is silence

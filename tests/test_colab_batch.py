@@ -389,3 +389,29 @@ def test_notion_publish():
     assert all(len(t["text"]["content"]) <= 2000 for b in body for t in b[b["type"]]["rich_text"])
     # Second run: already there → not added again
     assert nx.publish([[part]], notion, db, cb.lecture_text) == 0
+
+
+def test_transcribe_again_replaces_old_files(tmp_path):
+    base = str(tmp_path / "Vorlesungen")
+    backup = tmp_path / "Goodnotes" / "Master"
+    os.makedirs(os.path.join(base, "Inbox"))
+    os.makedirs(backup)
+    with open(os.path.join(base, "t.ics"), "w", encoding="utf-8") as f:
+        f.write(TRAINEX_ICS)
+    _goodnotes(str(backup / "M4 Doku.goodnotes"),
+               [("P1", 60, (2026, 10, 6, 8, 50, 0), 220), ("P2", 60, (2026, 10, 6, 9, 20, 0), 330)])
+    first = cb.run(base, FakeEngine(), backup_folders=[str(backup.parent)], log=lambda *_: None)
+    assert len(first["transcripts"]) == 1                     # two parts, one lecture
+
+    class Better(FakeEngine):
+        def transcribe(self, audio, language, prompt):
+            self.calls.append(1)
+            return [(0.0, 5.0, "Jetzt mit allen Wörtern.")], "de"
+    engine = Better()
+    again = cb.run(base, engine, backup_folders=[str(backup.parent)], log=lambda *_: None, again=True)
+    assert len(engine.calls) == 2 and again["transcripts"] == first["transcripts"]
+    files = os.listdir(os.path.dirname(first["transcripts"][0]))
+    assert len(files) == 1                                    # replaced, no "… (2).txt"
+    assert "Jetzt mit allen Wörtern." in open(first["transcripts"][0], encoding="utf-8").read()
+    # and a normal run afterwards does nothing
+    assert cb.run(base, FakeEngine(), backup_folders=[str(backup.parent)], log=lambda *_: None)["zip"] is None
