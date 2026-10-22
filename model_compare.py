@@ -39,6 +39,7 @@ MODELS = {
     "whisper-batched":    ("system", [], "Whisper large-v3, batched (current setup)"),
     "whisper-batched-loud": ("system", [], "Whisper large-v3, batched, quiet audio turned up"),
     "whisper-sequential": ("system", [], "Whisper large-v3, sequential with context"),
+    "whisper-sequential-loud": ("system", [], "Whisper large-v3, sequential, quiet audio turned up"),
     "primeline-german":   ("system", [], "Whisper large-v3 German fine-tune (primeline)"),
     "primeline-turbo-de": ("system", [], "Whisper large-v3-turbo German fine-tune (primeline)"),
     "voxtral-mini":       ("voxtral", ["transformers>=4.54", "mistral-common[audio]>=1.8.1",
@@ -109,13 +110,14 @@ def prepare(drive_root: str, clips: list[dict], out_dir: str, log=print) -> list
             log(f"✗ {c['id']}: recording {c['recording']} not in {os.path.basename(path)}")
             continue
         audio = store.decode_audio(rec.open(), SR)
-        a, b = int(c["start_min"] * 60 * SR), int((c["start_min"] + c["minutes"]) * 60 * SR)
+        a = int(c["start_min"] * 60 * SR)                 # minutes None: to the end
+        b = int((c["start_min"] + c["minutes"]) * 60 * SR) if c.get("minutes") else len(audio)
         wav = os.path.join(out_dir, f"{c['id']}.wav")
         _write_wav(wav, audio[a:b])
         manifest.append(dict(c, wav=wav, seconds=round(min(b, len(audio)) / SR - a / SR, 1),
                              slides=cb.slide_text(path), loudness=loudness(audio)))
         log(f"✓ {c['id']}: {os.path.basename(path)} › {c['recording']}, "
-            f"min {c['start_min']}–{c['start_min'] + c['minutes']} of {len(audio) / SR / 60:.0f}")
+            f"min {c['start_min']}–{min(b, len(audio)) / SR / 60:.0f} of {len(audio) / SR / 60:.0f}")
     with open(os.path.join(out_dir, "manifest.json"), "w", encoding="utf-8") as f:
         json.dump(manifest, f, ensure_ascii=False)
     return manifest
@@ -130,13 +132,19 @@ def _venv_python(name: str, packages: list[str], log) -> str:
     if not os.path.exists(py):
         log(f"   setting up {name} environment (a few minutes)…")
         subprocess.run([sys.executable, "-m", "pip", "install", "-q", "uv"], check=True)
-        subprocess.run(["uv", "venv", "-q", "--system-site-packages", root], check=True)
-        subprocess.run(["uv", "pip", "install", "-q", "--python", py, *packages], check=True)
+        for cmd in (["uv", "venv", "-q", "--system-site-packages", root],
+                    ["uv", "pip", "install", "-q", "--python", py, *packages]):
+            r = subprocess.run(cmd, capture_output=True, text=True)
+            if r.returncode != 0:
+                raise RuntimeError(f"{' '.join(cmd[:3])} failed:\n{(r.stdout + r.stderr)[-3000:]}")
     return py
 
 
 def run_all(manifest_path: str, models: list[str], out_dir: str, log=print) -> dict:
-    """Every model over every clip, each in its own process. → {model: {clip: result}}."""
+    """
+    Every model over every clip, each in its own process. → {model: {clip: result}}.
+    A model that fails as a whole gets {"_error": last lines of its output} for the report.
+    """
     results = {}
     for name in models:
         env, packages, label = MODELS[name]
@@ -150,7 +158,7 @@ def run_all(manifest_path: str, models: list[str], out_dir: str, log=print) -> d
                                     stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
             tail = []
             for line in proc.stdout:
-                tail = (tail + [line.rstrip()])[-15:]
+                tail = (tail + [line.rstrip()])[-40:]
                 if line.startswith(("  ✓", "  ✗", "  ⚠")):
                     log(line.rstrip())
             proc.wait()
@@ -158,8 +166,10 @@ def run_all(manifest_path: str, models: list[str], out_dir: str, log=print) -> d
                 with open(out, encoding="utf-8") as f:
                     results[name] = json.load(f)
             else:
-                log("  ✗ failed:\n     " + "\n     ".join(tail))
+                results[name] = {"_error": "\n".join(tail)}
+                log("  ✗ failed:\n     " + "\n     ".join(tail[-15:]))
         except Exception as e:
+            results[name] = {"_error": f"could not start: {e}"}
             log(f"  ✗ could not start: {e}")
     return results
 
@@ -174,25 +184,34 @@ def _transcriber(name: str):
         ensure_cuda_libs()
         model = WhisperModel("large-v3", device="cuda", compute_type="float16")
         vad = {"threshold": 0.35}
+        prep = louder if name.endswith("-loud") else (lambda a: a)
         if name.startswith("whisper-batched"):
             pipe = BatchedInferencePipeline(model)
-            prep = louder if name == "whisper-batched-loud" else (lambda a: a)
-            return lambda wav: " ".join(s.text.strip() for s in pipe.transcribe(
-                prep(_read_wav(wav)), language="de", batch_size=16, beam_size=5, vad_parameters=vad)[0])
-        return lambda wav: " ".join(s.text.strip() for s in model.transcribe(
-            _read_wav(wav), language="de", beam_size=5, vad_filter=True, vad_parameters=vad,
-            condition_on_previous_text=True)[0])
+
+            def run(audio):
+                return pipe.transcribe(audio, language="de", batch_size=16, beam_size=5,
+                                       vad_parameters=vad)[0]
+        else:
+            def run(audio):
+                return model.transcribe(audio, language="de", beam_size=5, vad_filter=True,
+                                        vad_parameters=vad, condition_on_previous_text=True)[0]
+
+        def whisper(wav):                         # text + where it was heard (for coverage)
+            segments = list(run(prep(_read_wav(wav))))
+            return " ".join(s.text.strip() for s in segments), [[round(s.start), round(s.end)] for s in segments]
+        return whisper
 
     if name.startswith("primeline"):
         from transformers import AutoModelForSpeechSeq2Seq, AutoProcessor, pipeline
         repo = {"primeline-german": "primeline/whisper-large-v3-german",
                 "primeline-turbo-de": "primeline/whisper-large-v3-turbo-german"}[name]
         model = AutoModelForSpeechSeq2Seq.from_pretrained(repo, torch_dtype=torch.float16,
+                                                          attn_implementation="sdpa",
                                                           low_cpu_mem_usage=True, use_safetensors=True)
         processor = AutoProcessor.from_pretrained(repo)
         pipe = pipeline("automatic-speech-recognition", model=model.to("cuda"),
                         tokenizer=processor.tokenizer, feature_extractor=processor.feature_extractor,
-                        max_new_tokens=128, chunk_length_s=30, batch_size=16, return_timestamps=True,
+                        max_new_tokens=128, chunk_length_s=30, batch_size=4, return_timestamps=True,
                         torch_dtype=torch.float16, device="cuda")
         return lambda wav: pipe(wav, generate_kwargs={"language": "german", "task": "transcribe"})["text"]
 
@@ -237,10 +256,15 @@ def _child(name: str, manifest_path: str, out_path: str) -> None:
     print(f"  ✓ loaded in {time.time() - t0:.0f} s", flush=True)
     results = {}
     for clip in manifest:
+        if clip.get("models") and name not in clip["models"]:
+            continue
         t0 = time.time()
         try:
-            text = transcribe(clip["wav"])
+            out = transcribe(clip["wav"])
+            text, spans = out if isinstance(out, tuple) else (out, None)
             results[clip["id"]] = {"text": text.strip(), "seconds": round(time.time() - t0, 1)}
+            if spans is not None:
+                results[clip["id"]]["spans"] = spans
             print(f"  ✓ {clip['id']}: {time.time() - t0:.0f} s", flush=True)
         except Exception as e:
             results[clip["id"]] = {"error": f"{type(e).__name__}: {e}"}
@@ -267,6 +291,24 @@ def score(text: str, slides: str, minutes: float, zipf) -> dict:
             "fillers": sum(1 for s in sentences if FILLER.match(s))}
 
 
+def coverage(spans: list, seconds: float) -> str:
+    """Which minutes got any text, and the stretches over 2 minutes without any."""
+    heard = set()
+    for a, b in spans:
+        heard.update(range(int(a // 60), int(b // 60) + 1))
+    total = max(1, int(-(-seconds // 60)))
+    gaps, start = [], None
+    for m in range(total + 1):
+        if m < total and m not in heard:
+            start = m if start is None else start
+        elif start is not None:
+            if m - start > 2:
+                gaps.append(f"{start}–{m} min")
+            start = None
+    return f"text in {len(heard & set(range(total)))} of {total} minutes" + \
+        (f"; nothing in {', '.join(gaps)}" if gaps else "")
+
+
 def report(manifest: list[dict], results: dict, out_dir: str, seed: int | None = None,
            zipf=None) -> tuple[str, str]:
     """Blind texts (Version A, B, …) + key file with model names and scores. → paths."""
@@ -286,6 +328,10 @@ def report(manifest: list[dict], results: dict, out_dir: str, seed: int | None =
     blind = [f"Model comparison {stamp} — which version is closest to what was said?", ""]
     key = [f"Key to Model-Comparison-{stamp}.txt", ""]
     key += [f"Version {letter[n]} = {MODELS[n][2]}" for n in names] + [""]
+    for n in names:
+        if "_error" in results[n]:
+            key += [f"✗ {MODELS[n][2]} failed as a whole — last output:",
+                    *("   " + line for line in results[n]["_error"].splitlines()), ""]
     for clip in manifest:
         minutes = clip["seconds"] / 60
         blind += ["=" * 78, f"{clip['id']}: {clip.get('why', '')}", "=" * 78, ""]
@@ -293,15 +339,20 @@ def report(manifest: list[dict], results: dict, out_dir: str, seed: int | None =
                 f"   {'version':8}{'model':22}{'words/min':>10}{'odd/1000':>10}{'slide terms':>12}"
                 f"{'fillers':>9}{'time s':>8}"]
         for n in names:
-            r = results[n].get(clip["id"], {"error": "not run"})
-            blind += [f"── Version {letter[n]} ──", r.get("text") or f"(failed: {r.get('error')})", ""]
+            if clip.get("models") and n not in clip["models"]:
+                continue
+            r = results[n].get(clip["id"], {"error": "model failed (see top of the key)"
+                                            if "_error" in results[n] else "not run"})
+            blind += [f"── Version {letter[n]} ──", r.get("text") or f"(failed: {r.get('error')[:300]})", ""]
             if "text" in r:
                 s = score(r["text"], clip.get("slides", ""), minutes, zipf)
                 key.append(f"   {letter[n]:8}{n:22}{s['words_per_min']:>10}{s['odd_per_1000']:>10}"
                            f"{s['slide_terms']:>12}{s['fillers']:>9}{r['seconds']:>8}")
                 key.append(f"   {'':8}odd words: {', '.join(s['odd_words'][:25])}")
+                if r.get("spans") is not None:
+                    key.append(f"   {'':8}{coverage(r['spans'], clip['seconds'])}")
             else:
-                key.append(f"   {letter[n]:8}{n:22}  failed: {r.get('error')}")
+                key.append(f"   {letter[n]:8}{n:22}  failed: {r.get('error')[:300]}")
         loud = clip.get("loudness", [])
         if loud:
             key.append(f"   whole recording, loudness per minute (dBFS): {loud}")
