@@ -90,6 +90,31 @@ def test_course_hint_from_notebook_name():
     assert cb.course_hint("Studium/M8 Basiskompetenzen", events).startswith("M8 ")
 
 
+def test_goodnotes_times_are_end_times():
+    """Two back-to-back GoodNotes recordings in one lecture (pattern from a real preview):
+    stamped 08:50 (50 min) and 09:31 (35 min) — they only fit 08:00–09:30 as end times."""
+    events = cb.course_calendar.parse_ics(TRAINEX_ICS)      # M4 Vorlesung 06.10. 08:00–09:30
+    doc = "M. Sc. Psychotherapie/M4 Qualitässicherung/M4_M6_Termin_2"
+    plans = [cb.plan(cb.Recording(source="x", key=k, open=None, label="x", doc=doc,
+                                  time=cb.datetime(2026, 10, 6, h, m), time_is_end=True,
+                                  time_source="GoodNotes, end of recording", duration_s=mins * 60),
+                     events)
+             for k, h, m, mins in (("a", 8, 50, 50), ("b", 9, 31, 35))]
+    assert [p["meta"]["started"][11:16] for p in plans] == ["08:00", "08:56"]
+    assert {p["group"] for p in plans} == {plans[0]["group"]}           # → one transcript
+    assert plans[0]["meta"]["title"] == "Vorlesung 06.10." and plans[0]["meta"]["kind"] == "Vorlesung"
+
+
+def test_topic_from_notebook_name():
+    assert cb.topic("M13 …/3_Replikation_v17071.pdf") == "Replikation"
+    assert cb.topic("M13 …/5_Datenqualitaet_v30439 2") == "Datenqualitaet"
+    assert cb.topic("VL_DMM_02_-_Itemanalyse_und_Exploratorische_Faktorenanalyse") \
+        == "Itemanalyse und Exploratorische Faktorenanalyse"
+    assert cb.topic("1_Warm_Up_und_Agenda_v88894.pdf") == "Warm Up und Agenda"
+    assert cb.topic("M4_M6_Termin_2") == "" and cb.topic("M1_2_IH") == "" and cb.topic("") == ""
+    assert cb.topic("M8 Basiskompetenzen", "M8 Psychotherapeutische Basiskompetenzen und …") == ""
+
+
 def test_preview_changes_nothing(tmp_path):
     base = str(tmp_path / "Vorlesungen")
     backup = tmp_path / "GoodNotes" / "M. Sc. Psychotherapie" / "M5 Testkonstruktion"
