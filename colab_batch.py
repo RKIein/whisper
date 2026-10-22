@@ -637,6 +637,13 @@ def overview(results: list[dict], errors: list[dict], files: dict[str, str]) -> 
 
 # ─── Run ─────────────────────────────────────────────────────
 
+def _prune(folder: str, prefix: str, keep: int = 3) -> None:
+    """Only the newest `keep` run files (Overview-…, Preview-…, Transkripte-….zip) stay."""
+    names = sorted(n for n in os.listdir(folder) if n.startswith(prefix))   # dated names sort by time
+    for name in names[:-keep]:
+        os.remove(os.path.join(folder, name))
+
+
 def _load(path, default):
     try:
         with open(path, encoding="utf-8") as f:
@@ -654,12 +661,13 @@ def _save(path, data):
 
 def run(base: str, engine, language: str | None = "de", backup_folders=(), publish=None,
         log=print, since="semester", only_folder: str = "", preview: bool = False,
-        again: bool = False) -> dict:
+        again: bool = False, app_zip: bool = True) -> dict:
     """
     preview=True only lists what was found and where it would go (Results/Preview-….txt);
     nothing is transcribed, moved or remembered.
     again=True transcribes backup recordings already done once more (after an improvement);
     their old transcript files are replaced, not kept next to the new ones.
+    app_zip=False skips the zip for the laptop app's “Import from Colab…”.
 
     Transcribe everything new in <base>/Inbox and the GoodNotes backup folder(s).
 
@@ -809,6 +817,7 @@ def run(base: str, engine, language: str | None = "de", backup_folders=(), publi
         path = os.path.join(results_dir, f"Preview-{datetime.now():%Y-%m-%d-%H%M}.txt")
         with open(path, "w", encoding="utf-8") as f:
             f.write(text)
+        _prune(results_dir, "Preview-")
         log("\n" + text)
         return {"transcripts": [], "zip": None, "unsorted": 0, "failed": len(errors), "preview": path}
 
@@ -831,17 +840,21 @@ def run(base: str, engine, language: str | None = "de", backup_folders=(), publi
         except Exception as e:
             log(f"⚠ Publishing failed (transcripts are still in Drive): {e}")
 
-    zip_path = os.path.join(results_dir, f"Transkripte-{datetime.now():%Y-%m-%d-%H%M}.zip")
-    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as z:
-        for p in paths:
-            z.write(p, "Transcripts/" + os.path.relpath(p, out_dir).replace(os.sep, "/"))
-        z.writestr(APP_IMPORT, json.dumps(
-            [{"folder": r["folder"], "meta": r["meta"], "transcript_md": r["transcript_md"]}
-             for r in pending], ensure_ascii=False))
+    zip_path = None
+    if app_zip:
+        zip_path = os.path.join(results_dir, f"Transkripte-{datetime.now():%Y-%m-%d-%H%M}.zip")
+        with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as z:
+            for p in paths:
+                z.write(p, "Transcripts/" + os.path.relpath(p, out_dir).replace(os.sep, "/"))
+            z.writestr(APP_IMPORT, json.dumps(
+                [{"folder": r["folder"], "meta": r["meta"], "transcript_md": r["transcript_md"]}
+                 for r in pending], ensure_ascii=False))
     text = overview(pending, errors, files)
     with open(os.path.join(results_dir, f"Overview-{datetime.now():%Y-%m-%d-%H%M}.txt"), "w",
               encoding="utf-8") as f:
         f.write(text)
+    for prefix in ("Overview-", "Transkripte-"):
+        _prune(results_dir, prefix)
 
     for r in pending:
         processed[r["key"]] = {"file": files[r["group"]], "source": r["source"]}

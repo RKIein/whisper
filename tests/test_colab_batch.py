@@ -415,3 +415,17 @@ def test_transcribe_again_replaces_old_files(tmp_path):
     assert "Jetzt mit allen Wörtern." in open(first["transcripts"][0], encoding="utf-8").read()
     # and a normal run afterwards does nothing
     assert cb.run(base, FakeEngine(), backup_folders=[str(backup.parent)], log=lambda *_: None)["zip"] is None
+
+
+def test_results_folder_keeps_only_recent_run_files(tmp_path):
+    for day in range(1, 6):
+        (tmp_path / f"Overview-2026-10-0{day}-1200.txt").write_text("x")
+        (tmp_path / f"Transkripte-2026-10-0{day}-1200.zip").write_text("x")
+    (tmp_path / "Model-Comparison-2026-10-22-1651.txt").write_text("x")
+    cb._prune(str(tmp_path), "Overview-")
+    cb._prune(str(tmp_path), "Transkripte-")
+    left = sorted(p.name for p in tmp_path.iterdir())
+    assert left == ["Model-Comparison-2026-10-22-1651.txt",
+                    "Overview-2026-10-03-1200.txt", "Overview-2026-10-04-1200.txt", "Overview-2026-10-05-1200.txt",
+                    "Transkripte-2026-10-03-1200.zip", "Transkripte-2026-10-04-1200.zip",
+                    "Transkripte-2026-10-05-1200.zip"]
