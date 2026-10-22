@@ -188,7 +188,7 @@ def from_goodnotes(path: str, work: str, skip=frozenset()) -> list[Recording]:
                             key=key, open=_extractor(path, i.filename, work, kind),
                             label=f"{doc} {len(out) + 1}", doc=doc)
             if dated:
-                rec.time, rec.time_is_end, rec.time_source = datetime(*i.date_time), True, "GoodNotes file date"
+                rec.time, rec.time_is_end, rec.time_source = datetime(*i.date_time), True, "GoodNotes file date, end"
             out.append(rec)
     return out
 
@@ -308,19 +308,48 @@ def course_hint(name: str, events) -> str | None:
 
 
 def match(events, start: datetime, duration_s: float, time_is_end: bool = False):
-    """The timetable event this recording overlaps most (or None)."""
+    """
+    The timetable event this recording overlaps most (or None). time_is_end: the time
+    marks the end (GoodNotes); that reading is tried first, the start reading as a fallback.
+    """
     windows = [(start - timedelta(seconds=duration_s), start)] if time_is_end else []
     windows.append((start, start + timedelta(seconds=duration_s)))
     need = min(MIN_OVERLAP_S, 0.3 * duration_s)
-    best, best_overlap = None, 0.0
-    for e in events:
-        if e.end - e.start >= timedelta(hours=12):
-            continue
-        for a, b in windows:
+    for a, b in windows:
+        best, best_overlap = None, 0.0
+        for e in events:
+            if e.end - e.start >= timedelta(hours=12):
+                continue
             overlap = (min(b, e.end) - max(a, e.start)).total_seconds()
             if overlap > best_overlap:
                 best, best_overlap = e, overlap
-    return best if best_overlap >= need else None
+        if best_overlap >= need:
+            return best
+    return None
+
+
+_TOPIC_NOISE = {"termin", "notizen", "vorlesung", "seminar", "sitzung", "folien", "skript"}
+
+
+def topic(doc: str, course: str = "") -> str:
+    """
+    A lecture topic from a GoodNotes notebook name, or '' if it has none:
+    '…/3_Replikation_v17071.pdf' → 'Replikation',
+    'VL_DMM_02_-_Itemanalyse_und_Exploratorische_Faktorenanalyse' → 'Itemanalyse und …',
+    'M4_M6_Termin_2' / 'M1_2_IH' / a notebook named after its course → ''.
+    """
+    name = re.split(r"[\\/]", doc or "")[-1]
+    name = re.sub(r"\.pdf$", "", name, flags=re.I)
+    name = re.sub(r"(_v\d+)?( \d+)?$", "", name)          # '_v17071', ' 2' (duplicate copy)
+    name = name.replace("_", " ").strip()
+    if " - " in name:                                     # 'VL DMM 02 - Itemanalyse …'
+        name = name.split(" - ", 1)[1]
+    name = re.sub(r"^(M\d+\s+)*(\d+\s+)?", "", name).strip()  # leading 'M8 ', '3 ', 'M1 2 '
+    words = re.findall(r"[A-Za-zÄÖÜäöüß]{5,}", name)
+    in_course = set(re.findall(r"[a-zäöüß]{5,}", course.lower()))
+    if not [w for w in words if w.lower() not in _TOPIC_NOISE | in_course]:
+        return ""
+    return name[:60].rstrip(" -,")
 
 
 def plan(rec: Recording, events) -> dict:
@@ -336,16 +365,19 @@ def plan(rec: Recording, events) -> dict:
     candidates = [e for e in events if e.course == hint] if hint else events
     event = match(candidates, when, rec.duration_s, rec.time_is_end) if when else None
     meta = {"language": "auto", "bookmarks": [], "origin": "upload"}
+    about = topic(rec.doc, event.course if event else (hint or ""))
+    about = f" – {about}" if about else ""
     if event:
         start = max(start, event.start - timedelta(minutes=30))
-        meta.update(course=event.course, title=f"{event.kind or 'Lecture'} {event.start:%d.%m.}",
+        meta.update(course=event.course, title=f"{event.kind or 'Lecture'} {event.start:%d.%m.}{about}",
                     kind=event.kind, lecturer=event.lecturer, room=event.room,
                     calendar=event.to_meta())
-        how = f"timetable ({rec.time_source})" + (" + notebook name" if hint else "")
+        how = f"timetable ({rec.time_source})" + (" + GoodNotes folder/name" if hint else "")
         group = f"{event.course}|{event.start:%Y-%m-%dT%H:%M}"
     elif hint:
-        meta.update(course=hint, title=f"Recording {start:%d.%m.}" if start else rec.label)
-        how = "notebook name" + (f", no event at {start:%d.%m. %H:%M}" if start else ", no recording time")
+        meta.update(course=hint, title=f"Recording {start:%d.%m.}{about}" if start else rec.label)
+        how = "GoodNotes folder/name" + (f", no event at {start:%d.%m. %H:%M}" if start
+                                         else ", no recording time")
         group = f"{hint}|{start:%Y-%m-%d}" if start else f"rec:{rec.key}"
     else:
         meta.update(course=UNSORTED, title=rec.label)
@@ -596,12 +628,15 @@ def run(base: str, engine, language: str | None = "de", backup_folders=(), publi
             rec.duration_s, meta_time = probe(audio_path)
             if rec.meta is None:
                 if meta_time:
-                    rec.time, rec.time_is_end, rec.time_source = meta_time, False, "audio metadata"
+                    # GoodNotes stamps a recording when it *ends* (back-to-back recordings
+                    # in Robin's notebooks only fit that way); other apps stamp the start.
+                    gn = bool(rec.doc)
+                    rec.time, rec.time_is_end = meta_time, gn
+                    rec.time_source = "GoodNotes, end of recording" if gn else "audio metadata"
                 elif rec.time is None and time_from_name(rec.label):
                     rec.time, rec.time_source = time_from_name(rec.label), "file name"
             if preview:
-                when = f"{rec.time:%d.%m.%Y %H:%M} ({rec.time_source}" + \
-                       (", end of recording)" if rec.time_is_end else ")") if rec.time else "no time"
+                when = f"{rec.time:%d.%m.%Y %H:%M} ({rec.time_source})" if rec.time else "no time"
                 size = os.path.getsize(audio_path) / 1e6
                 if too_old(rec):
                     found.append(f"–  {rec.source}   {when} → skip, earlier semester")
