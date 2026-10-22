@@ -42,5 +42,9 @@ def test_prepare_and_blind_report(tmp_path):
 
 
 def test_coverage_finds_the_gap():
-    spans = [[0, 50], [60, 1110]] + [[1700, 1760]]          # text until 18:30, then minute 28
-    assert mc.coverage(spans, 61 * 60) == "text in 21 of 61 minutes; nothing in 19–28 min, 30–61 min"
+    # one segment per minute until 18:30, then one at minute 28 — and a batched segment that
+    # starts at 18:30 but claims to end at 27:00 must not count as text for 19–27
+    spans = [[m * 60, m * 60 + 50, 100] for m in range(18)] + [[1110, 1620, 40], [1700, 1760, 100]]
+    assert mc.coverage(spans, 61 * 60) == (
+        "text in 20 of 61 minutes; nothing in 19–28 min, 29–61 min\n"
+        "           words per 5 min: 500 500 500 340 0 100 0 0 0 0 0 0 0")

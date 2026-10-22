@@ -38,6 +38,8 @@ FILLER = re.compile(r"(?i)^(vielen dank( f(ü|ue)r'?s? (zuschauen|zuhören))?|un
 MODELS = {
     "whisper-batched":    ("system", [], "Whisper large-v3, batched (current setup)"),
     "whisper-batched-loud": ("system", [], "Whisper large-v3, batched, quiet audio turned up"),
+    "whisper-batched-loud-vad20": ("system", [], "Whisper large-v3, batched, louder, speech detector 0.20"),
+    "whisper-batched-loud-vad05": ("system", [], "Whisper large-v3, batched, louder, speech detector 0.05"),
     "whisper-sequential": ("system", [], "Whisper large-v3, sequential with context"),
     "whisper-sequential-loud": ("system", [], "Whisper large-v3, sequential, quiet audio turned up"),
     "primeline-german":   ("system", [], "Whisper large-v3 German fine-tune (primeline)"),
@@ -192,8 +194,9 @@ def _transcriber(name: str):
         from colab_batch import ensure_cuda_libs     # CTranslate2 needs CUDA 12 libraries
         ensure_cuda_libs()
         model = WhisperModel("large-v3", device="cuda", compute_type="float16")
-        vad = {"threshold": 0.35}
-        prep = louder if name.endswith("-loud") else (lambda a: a)
+        m = re.search(r"-vad(\d\d)$", name)       # speech detector threshold (production: 0.35)
+        vad = {"threshold": int(m.group(1)) / 100 if m else 0.35}
+        prep = louder if "-loud" in name else (lambda a: a)
         if name.startswith("whisper-batched"):
             pipe = BatchedInferencePipeline(model)
 
@@ -205,9 +208,10 @@ def _transcriber(name: str):
                 return model.transcribe(audio, language="de", beam_size=5, vad_filter=True,
                                         vad_parameters=vad, condition_on_previous_text=True)[0]
 
-        def whisper(wav):                         # text + where it was heard (for coverage)
+        def whisper(wav):                         # text + where (and how much) was heard
             segments = list(run(prep(_read_wav(wav))))
-            return " ".join(s.text.strip() for s in segments), [[round(s.start), round(s.end)] for s in segments]
+            return (" ".join(s.text.strip() for s in segments),
+                    [[round(s.start), round(s.end), len(s.text.split())] for s in segments])
         return whisper
 
     if name.startswith("primeline"):
@@ -301,10 +305,18 @@ def score(text: str, slides: str, minutes: float, zipf) -> dict:
 
 
 def coverage(spans: list, seconds: float) -> str:
-    """Which minutes got any text, and the stretches over 2 minutes without any."""
+    """
+    Which minutes got any text, the stretches over 2 minutes without any, and (long clips)
+    words per 5 minutes. A segment counts for the minute it starts in: in batched mode one
+    segment can bridge minutes the speech detector skipped, so its end proves nothing
+    (round 2 reported 61 of 61 minutes for a recording that still had a 12-minute gap).
+    """
     heard = set()
-    for a, b in spans:
-        heard.update(range(int(a // 60), int(b // 60) + 1))
+    per5 = [0] * (int(seconds // 300) + 1)
+    for span in spans:
+        heard.add(int(span[0] // 60))
+        if len(span) > 2:
+            per5[min(int(span[0] // 300), len(per5) - 1)] += span[2]
     total = max(1, int(-(-seconds // 60)))
     gaps, start = [], None
     for m in range(total + 1):
@@ -314,8 +326,11 @@ def coverage(spans: list, seconds: float) -> str:
             if m - start > 2:
                 gaps.append(f"{start}–{m} min")
             start = None
-    return f"text in {len(heard & set(range(total)))} of {total} minutes" + \
+    out = f"text in {len(heard & set(range(total)))} of {total} minutes" + \
         (f"; nothing in {', '.join(gaps)}" if gaps else "")
+    if seconds > 600 and any(len(span) > 2 for span in spans):
+        out += "\n           words per 5 min: " + " ".join(str(n) for n in per5)
+    return out
 
 
 def report(manifest: list[dict], results: dict, out_dir: str, seed: int | None = None,
