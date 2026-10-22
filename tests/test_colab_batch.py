@@ -159,6 +159,36 @@ def test_semester_flow(tmp_path):
     assert cb.run(base, engine, backup_folders=[str(backup)], log=lambda *_: None)["zip"] is None
 
 
+def test_old_semesters_in_backup_are_skipped(tmp_path):
+    base = str(tmp_path / "Vorlesungen")
+    backup = tmp_path / "Goodnotes"
+    os.makedirs(os.path.join(base, "Inbox"))
+    with open(os.path.join(base, "t.ics"), "w", encoding="utf-8") as f:
+        f.write(TRAINEX_ICS)                               # semester starts 05.10.2026
+    os.makedirs(backup / "Bachelor")
+    os.makedirs(backup / "Master")
+    # Bachelor: a dated recording from 2024, and an undated one (all files stamped alike)
+    _goodnotes(str(backup / "Bachelor" / "Statistik II.goodnotes"),
+               [("OLD1", 60, (2024, 5, 14, 11, 0, 0), 220)])
+    with zipfile.ZipFile(str(backup / "Bachelor" / "Sozialpsychologie.goodnotes"), "w") as z:
+        for name, data in (("index.notes.pb", b"x" * 100), ("attachments/OLD2", _wav_bytes(60, 660))):
+            z.writestr(zipfile.ZipInfo(name, (2026, 10, 20, 9, 0, 0)), data)
+    # Master: this semester
+    _goodnotes(str(backup / "Master" / "M4 Doku.goodnotes"), [("NEW1", 60, (2026, 10, 6, 9, 25, 0), 330)])
+
+    engine = FakeEngine()
+    res = cb.run(base, engine, backup_folders=[str(backup)], log=lambda *_: None)
+    assert len(engine.calls) == 1 and len(res["transcripts"]) == 1      # only the M4 recording
+    processed = json.load(open(os.path.join(base, ".state", "processed.json"), encoding="utf-8"))
+    assert sum(v.get("skipped") == "before this semester" for v in processed.values()) == 2
+    # Next run: nothing to unpack or transcribe again
+    engine.calls.clear()
+    assert cb.run(base, engine, backup_folders=[str(backup)], log=lambda *_: None)["zip"] is None
+    assert engine.calls == []
+    # Folder filter
+    assert [os.path.basename(p) for p in cb.backup_files([str(backup)], only="master")] == ["M4 Doku.goodnotes"]
+
+
 def test_resume_after_disconnect(tmp_path):
     base = str(tmp_path / "Vorlesungen")
     os.makedirs(os.path.join(base, "Inbox"))

@@ -236,13 +236,23 @@ def inbox_files(inbox: str) -> list[str]:
             and os.path.splitext(n)[1].lower() in AUDIO_EXT | {".zip", ".goodnotes"}]
 
 
-def backup_files(folders: list[str]) -> list[str]:
-    """All .goodnotes files in the GoodNotes backup folder(s), recursively."""
+def backup_files(folders: list[str], only: str = "") -> list[str]:
+    """All .goodnotes files in the GoodNotes backup folder(s), recursively.
+    only: keep files whose path inside the backup contains this (e.g. a GoodNotes folder name)."""
     out = []
     for folder in folders:
         for root, _, files in os.walk(folder):
-            out += [os.path.join(root, f) for f in sorted(files) if f.lower().endswith(".goodnotes")]
+            for f in sorted(files):
+                path = os.path.join(root, f)
+                if f.lower().endswith(".goodnotes") and \
+                        (not only or only.lower() in os.path.relpath(path, folder).lower()):
+                    out.append(path)
     return out
+
+
+def semester_start(events) -> datetime | None:
+    """Two weeks before the first timetable event — older recordings are from earlier semesters."""
+    return min(e.start for e in events) - timedelta(days=14) if events else None
 
 
 def find_goodnotes_backup(drive_root: str) -> list[str]:
@@ -492,9 +502,15 @@ def _save(path, data):
 
 
 def run(base: str, engine, language: str | None = "de", backup_folders=(), publish=None,
-        log=print) -> dict:
+        log=print, since="semester", only_folder: str = "") -> dict:
     """
     Transcribe everything new in <base>/Inbox and the GoodNotes backup folder(s).
+
+    GoodNotes backs up *all* notebooks (old semesters too). From the backup, only
+    recordings made since `since` are transcribed: "semester" = from two weeks before
+    the timetable's first event, a datetime, or None for everything. Undated ones
+    count only if their notebook name has a module code from the timetable.
+    only_folder limits the backup to one GoodNotes folder. The Inbox is never filtered.
 
     publish(groups) is called with the finished lectures (e.g. Notion upload).
     Returns {"transcripts": [paths], "zip": path or None, "unsorted": n, "failed": n}.
@@ -513,8 +529,20 @@ def run(base: str, engine, language: str | None = "de", backup_folders=(), publi
     log(f"Timetable: {len(events)} events" if events else
         "⚠ No timetable (.ics) in the folder — sorting only by GoodNotes notebook names.")
 
+    if since == "semester":
+        since = semester_start(events)
+    old = 0
+
+    def too_old(rec: Recording) -> bool:
+        """Backup recording from an earlier semester (or undated in an unrelated notebook)."""
+        if since is None or rec.inbox_file or rec.meta:
+            return False
+        if rec.time is not None:
+            return rec.time < since
+        return course_hint(rec.doc or rec.label, events) is None
+
     skip = set(processed) | {r["key"] for r in pending}
-    sources = [(p, False) for p in backup_files(list(backup_folders))] + \
+    sources = [(p, False) for p in backup_files(list(backup_folders), only_folder)] + \
               [(p, True) for p in inbox_files(inbox)]
     work = tempfile.mkdtemp(prefix="lectures-")
     todo: list[Recording] = []
@@ -528,10 +556,19 @@ def run(base: str, engine, language: str | None = "de", backup_folders=(), publi
         for r in recs:
             r.inbox_file = path if is_inbox else None
             skip.add(r.key)                       # the same recording in two files → once
-        todo += recs
+            if r.time is not None and too_old(r):  # GoodNotes file date: decided without unpacking
+                processed[r.key] = {"skipped": "before this semester"}
+                old += 1
+            else:
+                todo.append(r)
         if is_inbox and not recs:
             shutil.move(path, os.path.join(done, os.path.basename(path)))
-    log(f"{len(todo)} new recording(s) to transcribe"
+    if old:
+        _save(processed_path, processed)
+    if since:
+        log(f"Only recordings since {since:%d.%m.%Y} from the GoodNotes backup"
+            + (f" ({old} older ones skipped)" if old else "") + ".")
+    log(f"{len(todo)} new recording(s) to check"
         + (f" ({len(pending)} already done before a disconnect)" if pending else "") + ".")
 
     failed_files = set()
@@ -544,7 +581,10 @@ def run(base: str, engine, language: str | None = "de", backup_folders=(), publi
                     rec.time, rec.time_is_end, rec.time_source = meta_time, False, "audio metadata"
                 elif rec.time is None and time_from_name(rec.label):
                     rec.time, rec.time_source = time_from_name(rec.label), "file name"
-            if rec.duration_s and rec.duration_s < MIN_DURATION_S:
+            if too_old(rec):
+                processed[rec.key] = {"skipped": "before this semester"}
+                old += 1
+            elif rec.duration_s and rec.duration_s < MIN_DURATION_S:
                 log(f"[{n}/{len(todo)}] skipped (only {rec.duration_s:.0f} s): {rec.source}")
                 processed[rec.key] = {"skipped": "too short"}
             else:
