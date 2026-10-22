@@ -105,6 +105,38 @@ def test_goodnotes_times_are_end_times():
     assert plans[0]["meta"]["title"] == "Vorlesung 06.10." and plans[0]["meta"]["kind"] == "Vorlesung"
 
 
+BLOCK_DAY_ICS = "BEGIN:VCALENDAR\r\n" + "".join(
+    "BEGIN:VEVENT\r\nSUMMARY:M13 I Multivariate Verfahren/Vorlesung - R0.0 (Hörsaal) - x\r\n"
+    f"DTSTART:20261009T{a}00\r\nDTEND:20261009T{b}00\r\nEND:VEVENT\r\n"
+    for a, b in (("0945", "1115"), ("1130", "1300"))) + "END:VCALENDAR\r\n"
+
+
+def test_block_day_groups_by_notebook():
+    """Robin's real 09.10.: the Replikation deck started at 10:55, before the 11:30 slot.
+    Its two recordings belong together — not with the Wiederholung deck of the 09:45 slot."""
+    events = cb.course_calendar.parse_ics(BLOCK_DAY_ICS)
+    folder = "M. Sc. Psychotherapie/M13 Multivariate Verfahren - Forschungsmethoden/"
+
+    def p(key, doc, h, m, mins):
+        return cb.plan(cb.Recording(source=key, key=key, open=None, label=key, doc=folder + doc,
+                                    time=cb.datetime(2026, 10, 9, h, m), time_is_end=True,
+                                    duration_s=mins * 60), events)
+    w1, w2 = p("w1", "2_Wiederholung_v06085.pdf", 10, 17, 36), p("w2", "2_Wiederholung_v06085.pdf", 10, 28, 11)
+    r1, r2 = p("r1", "3_Replikation_v17071.pdf", 11, 19, 24), p("r2", "3_Replikation_v17071.pdf", 12, 31, 61)
+    assert w1["group"] == w2["group"] and r1["group"] == r2["group"] != w1["group"]
+    assert r1["meta"]["title"] == "Vorlesung 09.10. – Replikation"
+    results = [{"group": x["group"], "meta": x["meta"], "transcript_md": ""} for x in (r2, w1, r1, w2)]
+    assert [[r["meta"]["started"][11:16] for r in g] for g in cb.lectures(results)] == \
+        [["09:41", "10:17"], ["10:55", "11:30"]]                       # parts in time order
+
+
+def test_title_umlauts_from_slides():
+    slides = "Einführung und Grundlagen\nEffektgrößen"
+    assert cb.fix_umlauts("Einfuehrung und Grundlagen", slides) == "Einführung und Grundlagen"
+    assert cb.fix_umlauts("Effektgroessen", slides) == "Effektgrößen"
+    assert cb.fix_umlauts("neue aktuelle Quellen", slides) == "neue aktuelle Quellen"
+
+
 def test_topic_from_notebook_name():
     assert cb.topic("M13 …/3_Replikation_v17071.pdf") == "Replikation"
     assert cb.topic("M13 …/5_Datenqualitaet_v30439 2") == "Datenqualitaet"
@@ -266,6 +298,20 @@ def test_resume_after_disconnect(tmp_path):
     res = cb.run(base, engine, log=lambda *_: None)
     assert len(engine.calls) == 1                  # only the unfinished one
     assert len(res["transcripts"]) == 2
+
+
+def test_results_saved_before_per_notebook_groups_are_regrouped():
+    """Lectures transcribed by the previous version keep their text; only the group changes."""
+    old = {"key": "k", "source": "M. Sc. Psychotherapie/M13 …/3_Replikation_v17071.pdf › 0E27",
+           "group": "M13 I Multivariate Verfahren|2026-10-09T09:45",
+           "meta": {"origin": "upload", "course": "M13 I Multivariate Verfahren",
+                    "started": "2026-10-09T10:55:00"}}
+    assert cb.regroup(old) == "M13 I Multivariate Verfahren|M. Sc. Psychotherapie/M13 …/3_Replikation_v17071.pdf|2026-10-09"
+    app = dict(old, source="Lectures.zip › 2026-10-06 13-52 – Seminar 1", group="app:x",
+               meta=dict(old["meta"], origin="app"))
+    assert cb.regroup(app) == "app:x"
+    unsorted = dict(old, group="rec:k", meta=dict(old["meta"], course=cb.UNSORTED))
+    assert cb.regroup(unsorted) == "rec:k"
 
 
 def test_setup_error_stops_early(tmp_path):
