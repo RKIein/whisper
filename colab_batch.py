@@ -25,7 +25,6 @@ What comes out
   optionally a Notion page per lecture (notion_export.py)
 """
 
-import difflib
 import hashlib
 import io
 import json
@@ -51,7 +50,6 @@ SR = 16000
 MIN_DURATION_S = 30          # skip accidental taps
 MIN_OVERLAP_S = 10 * 60      # how much a recording must overlap an event to count
 LOCAL_TZ = "Europe/Berlin"
-RESULT_VERSION = 2          # pending results older than this are transcribed again
 
 
 @dataclass
@@ -234,68 +232,6 @@ def slide_text(path: str) -> str:
 
 
 _WORD = re.compile(r"[A-Za-zÄÖÜäöüß][A-Za-zÄÖÜäöüß-]*[A-Za-zÄÖÜäöüß]")
-RARE_ZIPF = 1.5     # wordfreq score: heard words rarer than this may be misheard terms
-
-
-def suspects(text: str, slides: str, zipf=None) -> dict[str, str]:
-    """
-    Words in a transcript that look like a misheard slide term: unusual German that
-    wordfreq doesn't know ('Datenerhöhung', 'diskretiv', 'Bildkriterien'), not on the
-    slides themselves, and close to a word that is ('Datenerhebung', 'disjunktiv',
-    'Gütekriterien'). Returns heard (lower case) → slide term; {} without wordfreq.
-    Normal words never qualify, so 'normieren' isn't "corrected" to 'Normierung'.
-    """
-    if zipf is None:
-        try:
-            from wordfreq import zipf_frequency
-        except ImportError:
-            return {}
-        zipf = lambda w: zipf_frequency(w, "de")   # noqa: E731
-    terms = {w.lower(): w for w in _WORD.findall(slides) if len(w) >= 6}
-    out = {}
-    for h in sorted({w.lower() for w in _WORD.findall(text) if len(w) >= 6}):
-        if h in terms or zipf(h) >= RARE_ZIPF:
-            continue
-        pool = [t for t in terms if abs(len(t) - len(h)) <= 4 and t not in h and h not in t]
-        near = difflib.get_close_matches(h, pool, n=1, cutoff=0.65)
-        if near:
-            out[h] = terms[near[0]]
-    return out
-
-
-def _mentions(text: str, word: str) -> bool:
-    """`word` occurs in `text`, in any ending ('Datenerhebung', 'Datenerhebungen')."""
-    stem = word.lower()[:max(6, len(word) - 3)]
-    return any(w.lower().startswith(stem) for w in _WORD.findall(text))
-
-
-def fix_terms(segments, audio, slides: str, engine, language):
-    """
-    Re-decode only the pieces holding a suspected misheard term, with that slide term as
-    hint. The new text is kept only if the term now appears and the rest is (nearly)
-    unchanged. One hint for the whole lecture was tested on a real seminar and made the
-    model invent "Vielen Dank fürs Zuschauen" over real speech; this can't.
-    Returns (segments, [(start, heard, term)]).
-    """
-    found = suspects(" ".join(t for _, _, t in segments), slides)
-    if not found:
-        return segments, []
-    out, fixes = [], []
-    for s, e, text in segments:
-        hits = {h: t for h, t in found.items() if _mentions(text, h)}
-        if hits:
-            clip = audio[int(max(0.0, s - 0.3) * SR):int((e + 0.3) * SR)]
-            new = engine.redecode(clip, language, ", ".join(sorted(set(hits.values()))) + ".")
-            done = [(h, t) for h, t in hits.items() if _mentions(new, t) and not _mentions(new, h)]
-            rest_old = [w.lower() for w in _WORD.findall(text) if not any(_mentions(w, h) for h in hits)]
-            rest_new = [w.lower() for w in _WORD.findall(new)
-                        if not any(_mentions(w, t) for t in hits.values())]
-            same = difflib.SequenceMatcher(None, rest_old, rest_new).ratio()
-            if done and same >= 0.8 and len(rest_new) >= 0.85 * len(rest_old):
-                text = " " + new.strip()
-                fixes += [(s, h, t) for h, t in done]
-        out.append((s, e, text))
-    return out, fixes
 
 
 def fix_umlauts(title: str, slides: str) -> str:
@@ -531,13 +467,11 @@ def transcribe(rec: Recording, events, engine, language: str | None = "de") -> d
     rec.duration_s = len(audio) / SR
 
     lang = meta.get("language") if meta.get("language") not in (None, "", "auto") else language
-    # No prompt for the whole recording: tested on real lectures, a course name got echoed
-    # ("M13 I. M13 I. …") and a slide-term list made up "Vielen Dank" over real speech.
+    # No prompt. Tested on real lectures: a course name got echoed ("M13 I. M13 I. …"); slide
+    # terms, for the whole recording or just around suspected mishearings, made the model
+    # invent "Vielen Dank" over real speech and rarely fixed the term.
     t0 = time.time()
     raw, detected = engine.transcribe(audio, lang, None)
-    fixes = []
-    if rec.slides and hasattr(engine, "redecode"):      # misheard technical terms
-        raw, fixes = fix_terms(raw, audio, rec.slides(), engine, lang or detected)
     segments = [(s, e, t) for s, e, t in ((s, e, clean_segment(t)) for s, e, t in raw) if t]
 
     meta.update(duration_s=round(rec.duration_s, 1), detected_languages=[detected] if detected else [],
@@ -553,10 +487,8 @@ def transcribe(rec: Recording, events, engine, language: str | None = "de") -> d
     with open(os.path.join(session, store.TRANSCRIPT_MD), encoding="utf-8") as f:
         md = f.read()
     shutil.rmtree(session, ignore_errors=True)
-    meta["term_fixes"] = [{"t": round(t, 1), "heard": h, "slides": w} for t, h, w in fixes]
-    how = p["how"] + (f" · {len(fixes)} term(s) fixed from the slides" if fixes else "")
-    return {"v": RESULT_VERSION, "key": rec.key, "source": rec.source, "group": p["group"],
-            "folder": p["folder"], "how": how, "meta": meta, "transcript_md": md,
+    return {"key": rec.key, "source": rec.source, "doc": rec.doc, "group": p["group"],
+            "folder": p["folder"], "how": p["how"], "meta": meta, "transcript_md": md,
             "minutes": round(rec.duration_s / 60), "seconds_taken": round(time.time() - t0)}
 
 
@@ -604,6 +536,16 @@ def lecture_text(parts: list[dict]) -> str:
         for line in _body(p["transcript_md"]):
             out += [line, ""]
     return "\n".join(out).rstrip() + "\n"
+
+
+def regroup(r: dict) -> str:
+    """plan()'s per-notebook group for a result saved before there was one (from its source)."""
+    doc = r["source"].rsplit(" › ", 1)[0] if " › " in r["source"] else ""
+    doc = doc[:-len(".goodnotes")] if doc.endswith(".goodnotes") else doc     # Inbox file
+    course, day = r["meta"].get("course", UNSORTED), r["meta"].get("started", "")[:10]
+    if r["meta"].get("origin") != "upload" or not doc or not day or course == UNSORTED:
+        return r["group"]
+    return f"{course}|{doc}|{day}"
 
 
 MAX_PART_GAP_S = 60 * 60     # a notebook's recordings this far apart are separate lectures
@@ -671,9 +613,6 @@ def overview(results: list[dict], errors: list[dict], files: dict[str, str]) -> 
     for r in sorted(results, key=lambda r: (r["meta"]["course"], r["meta"].get("started", ""))):
         mark = "?" if r["meta"]["course"] == UNSORTED else "✓"
         lines.append(f"{mark} {files.get(r['group'], '')}   ← {r['source']} ({r['how']})")
-        for f in r["meta"].get("term_fixes", []):
-            lines.append(f"      [{int(f['t']) // 60:02d}:{int(f['t']) % 60:02d}] "
-                         f"„{f['heard']}“ → „{f['slides']}“")
     for e in errors:
         lines.append(f"✗ {e['source']}: {e['error']}")
     if any(r["meta"]["course"] == UNSORTED for r in results):
@@ -725,10 +664,9 @@ def run(base: str, engine, language: str | None = "de", backup_folders=(), publi
     pending_path = os.path.join(state_dir, "pending.json")        # transcribed, not yet written
     processed = _load(processed_path, {})
     pending = _load(pending_path, [])
-    redo = [r for r in pending if r.get("v", 1) < RESULT_VERSION]
-    if redo:                      # done before slide hints / per-notebook grouping → once more
-        pending = [r for r in pending if r not in redo]
-        log(f"{len(redo)} recording(s) from an earlier version are transcribed again.")
+    for r in pending:             # saved before groups were per notebook
+        if "doc" not in r:
+            r["group"] = regroup(r)
 
     events = load_events(base)
     log(f"Timetable: {len(events)} events" if events else
@@ -807,10 +745,8 @@ def run(base: str, engine, language: str | None = "de", backup_folders=(), publi
                     found.append(f"–  {rec.source}   {when} → skip, earlier semester")
                 else:
                     p = plan(rec, events)
-                    words = len(_WORD.findall(rec.slides())) if rec.slides else 0
-                    slides = f", slides: {words} words" if words else (", no slides" if rec.doc else "")
                     found.append(f"{'?' if p['meta']['course'] == UNSORTED else '✓'}  {rec.source}   "
-                                 f"{rec.duration_s / 60:.0f} min, {size:.1f} MB, {when}{slides}\n"
+                                 f"{rec.duration_s / 60:.0f} min, {size:.1f} MB, {when}\n"
                                  f"     → {p['meta']['course']} / {p['meta']['title']}   [{p['how']}]")
                 continue
             if too_old(rec):
@@ -969,16 +905,7 @@ class WhisperEngine:
             # missing CUDA libraries show up) would first run on the real recordings.
             noise = (np.random.default_rng(0).standard_normal(SR) * 0.05).astype(np.float32)
             list(whisper.transcribe(noise, language="de", beam_size=1, vad_filter=False)[0])
-        self._whisper = whisper
         self._model = BatchedInferencePipeline(whisper)
-
-    def redecode(self, clip, language: str | None, prompt: str) -> str:
-        """One short piece again, with a hint (fix_terms). No VAD: it is speech already."""
-        segments, _ = self._whisper.transcribe(clip, language=language, initial_prompt=prompt,
-                                               beam_size=5, vad_filter=False,
-                                               condition_on_previous_text=False,
-                                               without_timestamps=True)
-        return " ".join(s.text.strip() for s in segments)
 
     def transcribe(self, audio, language: str | None, prompt: str | None):
         kwargs = dict(language=language, batch_size=self.batch_size, beam_size=5)

@@ -130,64 +130,6 @@ def test_block_day_groups_by_notebook():
         [["09:41", "10:17"], ["10:55", "11:30"]]                       # parts in time order
 
 
-# zipf scores as wordfreq gives them (checked): misheard words are unknown (0), real ones aren't
-ZIPF = {"datenerhöhung": 0.0, "diskretiv": 0.0, "bildkriterien": 0.0, "normieren": 1.82,
-        "formulieren": 3.81, "bestimmen": 4.38}
-M5_SLIDES = "Gütekriterien\nDatenerhebung mit Routineverfahren\nAntwortkategorien: disjunktiv\nNormierung"
-
-
-def test_suspects_are_rare_words_near_a_slide_term():
-    heard = ("Da spielen die Bildkriterien eine Rolle. Eine Methode der Datenerhöhung. "
-             "Sie sollten diskretiv sein. Ich kann normieren und formulieren und bestimmen.")
-    assert cb.suspects(heard, M5_SLIDES, zipf=lambda w: ZIPF.get(w, 5.0)) == {
-        "bildkriterien": "Gütekriterien", "datenerhöhung": "Datenerhebung", "diskretiv": "disjunktiv"}
-
-
-class Redecodes(FakeEngine):
-    """Re-decodes with a hint: fixes the term, or (bad case) invents text over the speech."""
-
-    def __init__(self, replies):
-        super().__init__()
-        self.replies, self.prompts = replies, []
-
-    def redecode(self, clip, language, prompt):
-        self.prompts.append(prompt)
-        return self.replies[len(self.prompts) - 1]
-
-
-def test_fix_terms_keeps_only_safe_fixes(monkeypatch):
-    monkeypatch.setattr(cb, "suspects", lambda text, slides: {"datenerhöhung": "Datenerhebung",
-                                                              "diskretiv": "disjunktiv"})
-    segments = [(0.0, 20.0, " Ein Test ist eine Methode der Datenerhöhung in der Diagnostik."),
-                (20.0, 40.0, " Nichts Auffälliges hier."),
-                (40.0, 60.0, " Die Kategorien sollten diskretiv und vollständig sein, also gegenseitig ausschließend.")]
-    engine = Redecodes([" Ein Test ist eine Methode der Datenerhebung in der Diagnostik.",
-                        " Vielen Dank fürs Zuschauen."])                 # hallucination → rejected
-    audio = np.zeros(60 * SR, dtype=np.float32)
-    out, fixes = cb.fix_terms(segments, audio, "slides", engine, "de")
-    assert engine.prompts == ["Datenerhebung.", "disjunktiv."]           # only the two pieces
-    assert out[0][2] == " Ein Test ist eine Methode der Datenerhebung in der Diagnostik."
-    assert out[1] == segments[1] and out[2] == segments[2]               # unchanged
-    assert fixes == [(0.0, "datenerhöhung", "Datenerhebung")]
-
-
-def test_term_fixes_end_up_in_transcript_and_overview(tmp_path, monkeypatch):
-    base = str(tmp_path / "Vorlesungen")
-    os.makedirs(os.path.join(base, "Inbox"))
-    _goodnotes(os.path.join(base, "Inbox", "M4 Doku.goodnotes"), [("C1", 60, (2026, 10, 6, 9, 20, 0), 220)])
-    monkeypatch.setattr(cb, "slide_text", lambda path: M5_SLIDES)
-    monkeypatch.setattr(cb, "suspects", lambda text, slides: {"skalenniveaus": "Gütekriterien"} if slides else {})
-
-    class Engine(Redecodes):
-        def transcribe(self, audio, language, prompt):
-            return [(0.0, 5.0, " Heute geht es um Skalenniveaus und mehr.")], "de"
-    res = cb.run(base, Engine([" Heute geht es um Gütekriterien und mehr."]), log=lambda *_: None)
-    assert "Heute geht es um Gütekriterien und mehr." in open(res["transcripts"][0], encoding="utf-8").read()
-    overview = open(next(os.path.join(base, "Results", f) for f in os.listdir(os.path.join(base, "Results"))
-                         if f.startswith("Overview")), encoding="utf-8").read()
-    assert "1 term(s) fixed from the slides" in overview and "„skalenniveaus“ → „Gütekriterien“" in overview
-
-
 def test_title_umlauts_from_slides():
     slides = "Einführung und Grundlagen\nEffektgrößen"
     assert cb.fix_umlauts("Einfuehrung und Grundlagen", slides) == "Einführung und Grundlagen"
@@ -358,29 +300,18 @@ def test_resume_after_disconnect(tmp_path):
     assert len(res["transcripts"]) == 2
 
 
-def test_results_of_an_older_version_are_redone(tmp_path):
-    base = str(tmp_path / "Vorlesungen")
-    os.makedirs(os.path.join(base, "Inbox"))
-    _goodnotes(os.path.join(base, "Inbox", "M4 Doku.goodnotes"),
-               [("C1", 60, (2026, 10, 6, 9, 20, 0), 220), ("C2", 60, (2026, 10, 6, 15, 59, 0), 300)])
-
-    class Dies(FakeEngine):
-        def transcribe(self, audio, language, prompt):
-            if self.calls:
-                raise KeyboardInterrupt
-            return super().transcribe(audio, language, prompt)
-    try:
-        cb.run(base, Dies(), log=lambda *_: None)
-    except KeyboardInterrupt:
-        pass
-    state = os.path.join(base, ".state", "pending.json")
-    pending = json.load(open(state, encoding="utf-8"))
-    for r in pending:
-        r.pop("v")                                     # as saved before slide hints
-    json.dump(pending, open(state, "w", encoding="utf-8"))
-    engine = FakeEngine()
-    cb.run(base, engine, log=lambda *_: None)
-    assert len(engine.calls) == 2                      # both again, not just the unfinished one
+def test_results_saved_before_per_notebook_groups_are_regrouped():
+    """Lectures transcribed by the previous version keep their text; only the group changes."""
+    old = {"key": "k", "source": "M. Sc. Psychotherapie/M13 …/3_Replikation_v17071.pdf › 0E27",
+           "group": "M13 I Multivariate Verfahren|2026-10-09T09:45",
+           "meta": {"origin": "upload", "course": "M13 I Multivariate Verfahren",
+                    "started": "2026-10-09T10:55:00"}}
+    assert cb.regroup(old) == "M13 I Multivariate Verfahren|M. Sc. Psychotherapie/M13 …/3_Replikation_v17071.pdf|2026-10-09"
+    app = dict(old, source="Lectures.zip › 2026-10-06 13-52 – Seminar 1", group="app:x",
+               meta=dict(old["meta"], origin="app"))
+    assert cb.regroup(app) == "app:x"
+    unsorted = dict(old, group="rec:k", meta=dict(old["meta"], course=cb.UNSORTED))
+    assert cb.regroup(unsorted) == "rec:k"
 
 
 def test_setup_error_stops_early(tmp_path):
