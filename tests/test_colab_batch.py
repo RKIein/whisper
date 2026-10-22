@@ -429,3 +429,12 @@ def test_results_folder_keeps_only_recent_run_files(tmp_path):
                     "Overview-2026-10-03-1200.txt", "Overview-2026-10-04-1200.txt", "Overview-2026-10-05-1200.txt",
                     "Transkripte-2026-10-03-1200.zip", "Transkripte-2026-10-04-1200.zip",
                     "Transkripte-2026-10-05-1200.zip"]
+
+
+def test_text_gaps_are_named_in_the_overview():
+    starts = [m * 30.0 for m in range(38)] + [1920.0, 1950.0]       # text until 18:30, again from 32:00
+    assert cb.text_gaps(starts, 61 * 60) == [[1110, 1920], [1950, 3660]]
+    r = {"group": "g", "source": "Replikation › 7495", "how": "timetable",
+         "meta": {"course": "M13", "started": "2026-10-09T11:30:00", "gaps": [[1110, 1920]]}}
+    text = cb.overview([r], [], {"g": "Transkripte/M13/x.txt"})
+    assert "⚠ no text from 18:30 to 32:00 of this recording (14 min)" in text
