@@ -80,6 +80,35 @@ def test_course_hint_from_notebook_name():
     assert cb.course_hint("m4 Doku", events).startswith("M4 Dokumentation")
     assert cb.course_hint("M130 something", events) is None
     assert cb.course_hint("Mathe", events) is None
+    # Robin's real GoodNotes layout: the course folder decides, the notebook name is the fallback
+    assert cb.course_hint("M. Sc. Psychotherapie/M13 Multivariate Verfahren - Forschungsmethoden/"
+                          "3_Replikation_v17071.pdf", events).startswith("M13 I")
+    assert cb.course_hint("M. Sc. Psychotherapie/M4 Qualitässicherung/M4_M6_Termin_2",
+                          events).startswith("M4 ")
+    assert cb.course_hint("M. Sc. Psychotherapie/M5 Testkonstruktion/VL_DMM_01_-_Einfuehrung",
+                          events).startswith("M5 ")
+    assert cb.course_hint("Studium/M8 Basiskompetenzen", events).startswith("M8 ")
+
+
+def test_preview_changes_nothing(tmp_path):
+    base = str(tmp_path / "Vorlesungen")
+    backup = tmp_path / "GoodNotes" / "M. Sc. Psychotherapie" / "M5 Testkonstruktion"
+    os.makedirs(os.path.join(base, "Inbox"))
+    os.makedirs(backup)
+    with open(os.path.join(base, "t.ics"), "w", encoding="utf-8") as f:
+        f.write(TRAINEX_ICS)
+    _goodnotes(str(backup / "VL_DMM_01.goodnotes"), [("R1", 60, (2026, 10, 6, 16, 20, 0), 220)])
+    with zipfile.ZipFile(str(backup / "VL_DMM_02.goodnotes"), "w") as z:      # slides only
+        z.writestr("attachments/PDF", b"%PDF-1.7" + b"0" * 60000)
+    _mp3(os.path.join(base, "Inbox", "x.mp3"), 40)
+    res = cb.run(base, None, backup_folders=[str(tmp_path / "GoodNotes")], preview=True,
+                 log=lambda *_: None)
+    text = open(res["preview"], encoding="utf-8").read()
+    assert "VL_DMM_01 › R1" in text and "→ M5 Diagnostische Modelle" in text
+    assert "folders" not in text and "VL_DMM_02" in text.split("without new recordings")[1]
+    assert os.listdir(os.path.join(base, "Inbox")) == ["Done", "x.mp3"]   # nothing moved
+    assert not os.path.exists(os.path.join(base, ".state", "processed.json"))
+    assert not os.path.exists(os.path.join(base, "Transkripte"))
 
 
 def test_semester_flow(tmp_path):
