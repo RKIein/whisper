@@ -27,11 +27,20 @@ def test_prepare_and_blind_report(tmp_path):
     assert [c["id"] for c in manifest] == ["hard"] and manifest[0]["seconds"] == 60.0
     assert len(manifest[0]["loudness"]) == 2                # 2 minutes of tone, per minute
 
-    results = {"whisper-batched": {"hard": {"text": "Das ist die Inferenzstatistik.", "seconds": 3.0}},
-               "qwen3-asr": {"hard": {"error": "RuntimeError: boom"}}}
+    results = {"whisper-batched": {"hard": {"text": "Das ist die Inferenzstatistik.", "seconds": 3.0,
+                                            "spans": [[0, 20]]}},
+               "qwen3-asr": {"hard": {"error": "RuntimeError: boom"}},
+               "voxtral-mini": {"_error": "pip: ResolutionImpossible\ntransformers==4.40"}}
     texts, key = mc.report(manifest, results, str(tmp_path), seed=1, zipf=lambda w: 4.0)
     blind, key = open(texts, encoding="utf-8").read(), open(key, encoding="utf-8").read()
     assert "whisper" not in blind.lower() and "qwen" not in blind.lower()   # names only in the key
     assert "Das ist die Inferenzstatistik." in blind and "(failed: RuntimeError: boom)" in blind
     letter = re.search(r"Version (\w) = Whisper large-v3, batched", key).group(1)
     assert re.search(rf"\n   {letter}\s+whisper-batched\s+4\b", key)  # 4 words in 1 minute
+    assert "text in 1 of 1 minutes" in key
+    assert "Voxtral Mini 3B (Mistral) failed as a whole" in key and "ResolutionImpossible" in key
+
+
+def test_coverage_finds_the_gap():
+    spans = [[0, 50], [60, 1110]] + [[1700, 1760]]          # text until 18:30, then minute 28
+    assert mc.coverage(spans, 61 * 60) == "text in 21 of 61 minutes; nothing in 19–28 min, 30–61 min"
