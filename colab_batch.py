@@ -487,6 +487,7 @@ def transcribe(rec: Recording, events, engine, language: str | None = "de") -> d
     t0 = time.time()
     raw, detected = engine.transcribe(audio, lang, None)
     segments = [(s, e, t) for s, e, t in ((s, e, clean_segment(t)) for s, e, t in raw) if t]
+    meta["gaps"] = text_gaps([s for s, _, _ in segments], rec.duration_s)
 
     meta.update(duration_s=round(rec.duration_s, 1), detected_languages=[detected] if detected else [],
                 model=engine.name, transcribed_by="colab", status=store.STATUS_COMPLETE,
@@ -621,12 +622,29 @@ def write_transcripts(groups: list[list[dict]], out_dir: str) -> list[str]:
     return paths
 
 
+def text_gaps(starts: list[float], duration_s: float, min_gap_s: float = 120) -> list[list[int]]:
+    """
+    Stretches longer than min_gap_s without any text, as [from_s, to_s]. A break or group
+    work looks like this — but so did 47 lost minutes of a lecture (22.10.2026), so the
+    Overview names every one for a look.
+    """
+    edges = [0.0, *sorted(starts), duration_s]
+    return [[round(a), round(b)] for a, b in zip(edges, edges[1:]) if b - a > min_gap_s]
+
+
+def _mmss(seconds: float) -> str:
+    return f"{int(seconds) // 60}:{int(seconds) % 60:02d}"
+
+
 def overview(results: list[dict], errors: list[dict], files: dict[str, str]) -> str:
     """Which recording became which transcript, and what needs a look."""
     lines = [f"Transcribed {datetime.now():%d.%m.%Y %H:%M}", ""]
     for r in sorted(results, key=lambda r: (r["meta"]["course"], r["meta"].get("started", ""))):
         mark = "?" if r["meta"]["course"] == UNSORTED else "✓"
         lines.append(f"{mark} {files.get(r['group'], '')}   ← {r['source']} ({r['how']})")
+        for a, b in r["meta"].get("gaps", []):
+            lines.append(f"      ⚠ no text from {_mmss(a)} to {_mmss(b)} of this recording "
+                         f"({(b - a) / 60:.0f} min) — a break, or speech that was missed?")
     for e in errors:
         lines.append(f"✗ {e['source']}: {e['error']}")
     if any(r["meta"]["course"] == UNSORTED for r in results):
