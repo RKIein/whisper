@@ -621,6 +621,7 @@ def run(base: str, engine, language: str | None = "de", backup_folders=(), publi
         + (f" ({len(pending)} already done before a disconnect)" if pending else "") + ".")
 
     failed_files = set()
+    pending_before = len(pending)
     for n, rec in enumerate(todo, 1):
         try:
             audio_path = rec.open()
@@ -663,6 +664,11 @@ def run(base: str, engine, language: str | None = "de", backup_folders=(), publi
             errors.append({"source": rec.source, "error": str(e)})
             failed_files.add(rec.inbox_file)
             log(f"      ✗ failed: {e}")
+            if len(errors) == 3 and len({x["error"] for x in errors}) == 1 and \
+                    len(pending) == pending_before:
+                log("✗ Same error three times and nothing worked yet — a setup problem, "
+                    "not the recordings. Stopping; nothing is marked as done.")
+                break
         # Inbox file finished (and nothing failed) → Done. Not on a disconnect:
         # then the file stays and a rerun picks up its unfinished recordings.
         f = rec.inbox_file
@@ -741,18 +747,62 @@ MODELS = {
 VAD_THRESHOLD = 0.35
 
 
+def _load_cuda_libs() -> bool:
+    """Preload CUDA 12 cuBLAS + cuDNN 9 from pip's nvidia-* packages; True if loadable."""
+    import ctypes
+    import glob
+    import site
+    roots = [*site.getsitepackages(), site.getusersitepackages()]
+    libs = []
+    for pattern in ("libcublasLt.so.12", "libcublas.so.12", "libcudnn*.so.9"):
+        libs += sorted({p for r in roots for p in glob.glob(f"{r}/nvidia/*/lib/{pattern}")})
+    for _ in range(2):                        # second pass catches libs that needed a sibling first
+        for lib in libs:
+            try:
+                ctypes.CDLL(lib, mode=ctypes.RTLD_GLOBAL)
+            except OSError:
+                pass
+    try:
+        ctypes.CDLL("libcublas.so.12")
+        ctypes.CDLL("libcudnn.so.9")
+        return True
+    except OSError:
+        return False
+
+
+def ensure_cuda_libs(log=print) -> None:
+    """faster-whisper's GPU backend (CTranslate2) is built for CUDA 12 + cuDNN 9; newer Colab
+    images ship other versions, so fetch these and load them by hand."""
+    import subprocess
+    import sys
+    if not sys.platform.startswith("linux") or _load_cuda_libs():
+        return
+    log("Installing the CUDA libraries the speech model needs (about a minute)…")
+    subprocess.run([sys.executable, "-m", "pip", "install", "-q",
+                    "nvidia-cublas-cu12", "nvidia-cudnn-cu12==9.*"], check=True)
+    if not _load_cuda_libs():
+        raise RuntimeError("CUDA 12 libraries (cuBLAS, cuDNN 9) could not be loaded")
+
+
 class WhisperEngine:
     """faster-whisper on the GPU, batched (a 90-min lecture takes a few minutes on a T4)."""
 
     def __init__(self, model: str = "large-v3", device: str = "cuda", batch_size: int = 16,
                  vad_threshold: float | None = VAD_THRESHOLD):
         from faster_whisper import BatchedInferencePipeline, WhisperModel
+        if device == "cuda":
+            ensure_cuda_libs()
         compute = "float16" if device == "cuda" else "int8"
         self.name = model
         self.batch_size = batch_size if device == "cuda" else 4
         self.vad = {"threshold": vad_threshold} if vad_threshold else None
-        self._model = BatchedInferencePipeline(
-            WhisperModel(MODELS.get(model, model), device=device, compute_type=compute))
+        whisper = WhisperModel(MODELS.get(model, model), device=device, compute_type=compute)
+        if device == "cuda":
+            # Warm-up on noise, not silence: the VAD would drop silence and the GPU code (where
+            # missing CUDA libraries show up) would first run on the real recordings.
+            noise = (np.random.default_rng(0).standard_normal(SR) * 0.05).astype(np.float32)
+            list(whisper.transcribe(noise, language="de", beam_size=1, vad_filter=False)[0])
+        self._model = BatchedInferencePipeline(whisper)
 
     def transcribe(self, audio, language: str | None, prompt: str | None):
         kwargs = dict(language=language, batch_size=self.batch_size, beam_size=5)
