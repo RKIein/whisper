@@ -632,6 +632,27 @@ def repair_wav(path: str):
         f.write(_wav_header(sample_rate, frames))
 
 
+def decode_audio(path: str, sample_rate: int = 16000) -> np.ndarray:
+    """
+    Any audio file (mp3, m4a/GoodNotes, wav, …) → mono float32 at sample_rate, via PyAV.
+
+    Our own instead of faster_whisper.decode_audio: older faster-whisper versions pass
+    an option newer PyAV removed ('metadata_errors'), which broke every file on Colab.
+    """
+    import av
+    chunks = []
+    with av.open(path) as container:
+        stream = container.streams.audio[0]
+        resampler = av.AudioResampler(format="s16", layout="mono", rate=sample_rate)
+        for frame in container.decode(stream):
+            frame.pts = None                                  # let the resampler re-time
+            chunks += [f.to_ndarray().reshape(-1) for f in resampler.resample(frame)]
+        chunks += [f.to_ndarray().reshape(-1) for f in resampler.resample(None)]
+    if not chunks:
+        return np.zeros(0, dtype=np.float32)
+    return np.concatenate(chunks).astype(np.float32) / 32768.0
+
+
 def read_wav(path: str) -> tuple[np.ndarray, int]:
     """Read a 16-bit mono WAV → (float32 audio, sample_rate)."""
     import wave

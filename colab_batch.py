@@ -393,8 +393,7 @@ def plan(rec: Recording, events) -> dict:
 # ─── Transcription ───────────────────────────────────────────
 
 def load_audio(path: str) -> np.ndarray:
-    from faster_whisper import decode_audio
-    return decode_audio(path, sampling_rate=SR)
+    return store.decode_audio(path, SR)
 
 
 def transcribe(rec: Recording, events, engine, language: str | None = "de") -> dict:

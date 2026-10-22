@@ -431,8 +431,7 @@ def load_audio_16k(path: str) -> np.ndarray:
         audio, sr = store.read_wav(path)
         if sr == config.SAMPLE_RATE:
             return audio
-    from faster_whisper import decode_audio
-    return decode_audio(path, sampling_rate=config.SAMPLE_RATE)
+    return store.decode_audio(path, config.SAMPLE_RATE)
 
 
 def retranscribe(session_dir: str, model_id: str | None = None, on_progress=None) -> dict:
