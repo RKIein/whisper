@@ -477,7 +477,7 @@ def transcribe(rec: Recording, events, engine, language: str | None = "de") -> d
     from transcriber import clean_segment              # repetition loops, silence fillers
     p = plan(rec, events)
     meta = p["meta"]
-    audio = load_audio(rec.open())
+    audio = store.normalize_loudness(load_audio(rec.open()))   # quiet GoodNotes audio lost speech
     rec.duration_s = len(audio) / SR
 
     lang = meta.get("language") if meta.get("language") not in (None, "", "auto") else language
@@ -653,10 +653,13 @@ def _save(path, data):
 
 
 def run(base: str, engine, language: str | None = "de", backup_folders=(), publish=None,
-        log=print, since="semester", only_folder: str = "", preview: bool = False) -> dict:
+        log=print, since="semester", only_folder: str = "", preview: bool = False,
+        again: bool = False) -> dict:
     """
     preview=True only lists what was found and where it would go (Results/Preview-….txt);
     nothing is transcribed, moved or remembered.
+    again=True transcribes backup recordings already done once more (after an improvement);
+    their old transcript files are replaced, not kept next to the new ones.
 
     Transcribe everything new in <base>/Inbox and the GoodNotes backup folder(s).
 
@@ -698,7 +701,7 @@ def run(base: str, engine, language: str | None = "de", backup_folders=(), publi
             return rec.time < since
         return course_hint(rec.doc or rec.label, events) is None
 
-    skip = set(processed) | {r["key"] for r in pending}
+    skip = {k for k, v in processed.items() if not (again and "file" in v)} | {r["key"] for r in pending}
     sources = [(p, False) for p in backup_files(list(backup_folders), only_folder)] + \
               [(p, True) for p in inbox_files(inbox)]
     work = tempfile.mkdtemp(prefix="lectures-")
@@ -815,6 +818,10 @@ def run(base: str, engine, language: str | None = "de", backup_folders=(), publi
         log("Nothing new to transcribe." if not errors else "Nothing transcribed.")
         return {"transcripts": [], "zip": None, "unsorted": 0, "failed": len(errors)}
 
+    for r in pending:             # transcribed again: the new file replaces the old one
+        old = processed.get(r["key"], {}).get("file")
+        if old and os.path.exists(os.path.join(base, old)):
+            os.remove(os.path.join(base, old))
     groups = lectures(pending)
     paths = write_transcripts(groups, out_dir)
     files = {g[0]["group"]: os.path.relpath(p, base).replace(os.sep, "/") for g, p in zip(groups, paths)}
