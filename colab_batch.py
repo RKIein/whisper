@@ -289,15 +289,21 @@ _CODE = re.compile(r"(?<![A-Za-z])M\s?(\d{1,2})(?!\d)", re.I)
 
 
 def course_hint(name: str, events) -> str | None:
-    """'M13 Notizen' → the timetable course 'M13 I Multivariate …' (module code in the name)."""
-    m = _CODE.search(name or "")
-    if not m:
-        return None
-    code = f"M{int(m.group(1))}"
-    for e in events:
-        c = _CODE.match(e.course or "")
-        if c and f"M{int(c.group(1))}" == code:
-            return e.course
+    """
+    The timetable course a GoodNotes notebook belongs to, from module codes:
+    'M. Sc. Psychotherapie/M13 Multivariate …/3_Replikation' → 'M13 I Multivariate …'.
+    The nearest folder with a code wins (that's how you sorted it), then the notebook name.
+    """
+    parts = [p for p in re.split(r"[\\/]", name or "") if p]
+    for part in [*reversed(parts[:-1]), *parts[-1:]]:
+        m = _CODE.search(part)
+        if not m:
+            continue
+        code = f"M{int(m.group(1))}"
+        for e in events:
+            c = _CODE.match(e.course or "")
+            if c and f"M{int(c.group(1))}" == code:
+                return e.course
     return None
 
 
@@ -502,8 +508,11 @@ def _save(path, data):
 
 
 def run(base: str, engine, language: str | None = "de", backup_folders=(), publish=None,
-        log=print, since="semester", only_folder: str = "") -> dict:
+        log=print, since="semester", only_folder: str = "", preview: bool = False) -> dict:
     """
+    preview=True only lists what was found and where it would go (Results/Preview-….txt);
+    nothing is transcribed, moved or remembered.
+
     Transcribe everything new in <base>/Inbox and the GoodNotes backup folder(s).
 
     GoodNotes backs up *all* notebooks (old semesters too). From the backup, only
@@ -547,23 +556,32 @@ def run(base: str, engine, language: str | None = "de", backup_folders=(), publi
     work = tempfile.mkdtemp(prefix="lectures-")
     todo: list[Recording] = []
     errors = []
+    found: list[str] = []                         # preview lines
+    empty: list[str] = []                         # notebooks without (new) recordings
     for path, is_inbox in sources:
         try:
             recs = collect(path, work, skip)
         except Exception as e:
             errors.append({"source": os.path.basename(path), "error": f"can't open: {e}"})
             continue
+        root = next((b for b in backup_folders if not is_inbox and path.startswith(b)), None)
+        if not recs and root:
+            empty.append(os.path.relpath(path, root).replace(os.sep, "/"))
         for r in recs:
             r.inbox_file = path if is_inbox else None
+            if root and r.doc:      # 'M. Sc. Psychotherapie/M13 …/3_Replikation' — folders hint the course
+                r.doc = os.path.splitext(os.path.relpath(path, root))[0].replace(os.sep, "/")
+                r.source = f"{r.doc} › {r.source.split(' › ')[-1]}"
             skip.add(r.key)                       # the same recording in two files → once
             if r.time is not None and too_old(r):  # GoodNotes file date: decided without unpacking
                 processed[r.key] = {"skipped": "before this semester"}
                 old += 1
+                found.append(f"–  {r.source}   {r.time:%d.%m.%Y %H:%M} ({r.time_source}) → skip, earlier semester")
             else:
                 todo.append(r)
-        if is_inbox and not recs:
+        if is_inbox and not recs and not preview:
             shutil.move(path, os.path.join(done, os.path.basename(path)))
-    if old:
+    if old and not preview:
         _save(processed_path, processed)
     if since:
         log(f"Only recordings since {since:%d.%m.%Y} from the GoodNotes backup"
@@ -581,6 +599,18 @@ def run(base: str, engine, language: str | None = "de", backup_folders=(), publi
                     rec.time, rec.time_is_end, rec.time_source = meta_time, False, "audio metadata"
                 elif rec.time is None and time_from_name(rec.label):
                     rec.time, rec.time_source = time_from_name(rec.label), "file name"
+            if preview:
+                when = f"{rec.time:%d.%m.%Y %H:%M} ({rec.time_source}" + \
+                       (", end of recording)" if rec.time_is_end else ")") if rec.time else "no time"
+                size = os.path.getsize(audio_path) / 1e6
+                if too_old(rec):
+                    found.append(f"–  {rec.source}   {when} → skip, earlier semester")
+                else:
+                    p = plan(rec, events)
+                    found.append(f"{'?' if p['meta']['course'] == UNSORTED else '✓'}  {rec.source}   "
+                                 f"{rec.duration_s / 60:.0f} min, {size:.1f} MB, {when}\n"
+                                 f"     → {p['meta']['course']} / {p['meta']['title']}   [{p['how']}]")
+                continue
             if too_old(rec):
                 processed[rec.key] = {"skipped": "before this semester"}
                 old += 1
@@ -606,6 +636,21 @@ def run(base: str, engine, language: str | None = "de", backup_folders=(), publi
                 not any(r.inbox_file == f for r in todo[n:]):
             shutil.move(f, os.path.join(done, os.path.basename(f)))
     shutil.rmtree(work, ignore_errors=True)
+
+    if preview:
+        notebooks = len({s for s, inbox_ in sources if not inbox_})
+        text = (f"Preview {datetime.now():%d.%m.%Y %H:%M} — nothing transcribed yet\n"
+                f"{notebooks} GoodNotes notebook(s), {len(inbox_files(inbox))} Inbox file(s), "
+                f"{len(found)} recording(s)" + (f" (semester from {since:%d.%m.%Y})" if since else "")
+                + "\n\n" + "\n".join(found or ["No recordings found."]) + "\n"
+                + (f"\nNotebooks without new recordings ({len(empty)}):\n" + "\n".join(f"   {e}" for e in empty)
+                   + "\n" if empty else "")
+                + "".join(f"\n✗ {e['source']}: {e['error']}" for e in errors))
+        path = os.path.join(results_dir, f"Preview-{datetime.now():%Y-%m-%d-%H%M}.txt")
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(text)
+        log("\n" + text)
+        return {"transcripts": [], "zip": None, "unsorted": 0, "failed": len(errors), "preview": path}
 
     if not pending:
         for e in errors:
