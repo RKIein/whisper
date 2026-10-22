@@ -1,5 +1,16 @@
 import lecture
-from transcriber import clean_segment
+from transcriber import clean_segment, strip_prompt_echo
+
+
+def test_prompt_echo_removed():
+    prompt = "Seminar: M13 I Multivariate Verfahren, Forschungsmethoden & Psychotherapieforschung I."
+    # real outputs from the seminar test
+    assert strip_prompt_echo("M13 I. M13 I. M13 I. Das ist jetzt ein Ultra-Werk, ne?", prompt) \
+        == "Das ist jetzt ein Ultra-Werk, ne?"
+    assert strip_prompt_echo("M13 I Multivariate Verfahren & Psychotherapieforschung I. I. I.", prompt) == ""
+    kept = "Dann öffnet sich ein Dropdown-Menü, in dem Sie das Skalenniveau verändern."
+    assert strip_prompt_echo(kept, prompt) == kept
+    assert strip_prompt_echo(kept, None) == kept
 
 
 def test_repetition_loops_collapse():

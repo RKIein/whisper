@@ -133,20 +133,24 @@ Pick the lecture’s language (Deutsch / English) for each course — it’s rem
 
 ### Batch transcription on Google Colab
 
-Transcribe a whole stack of recordings at once on Google's GPU, with the most accurate Whisper model (`large-v3`, roughly 2–4 min per 90-min lecture). Each one is sorted into its course using your timetable, and you get one readable text transcript per lecture.
+Transcribe all your recordings at once on Google's GPU and get **one readable transcript per lecture**, sorted into your courses using the timetable. Recordings made in **GoodNotes** on the iPad are picked up automatically, with no exporting or renaming.
 
 [**Open the notebook in Colab**](https://colab.research.google.com/github/RKIein/whisper/blob/master/colab/Lecture_Transcriber.ipynb)
 
-1. **Once:** in Google Drive, create `Vorlesungen/Inbox` and put your TraiNex `.ics` into `Vorlesungen`.
-2. **Upload** into `Vorlesungen/Inbox`. You can mix:
-   - *Lecture library → Send to Colab…*, which packs every lecture not yet transcribed in Colab into one zip in your Downloads
-   - GoodNotes recordings: exported `.mp3` files, or whole `.goodnotes` documents
-   - any other audio files
-3. **Run:** in the notebook, *Runtime → Run all*. If you get disconnected, run it again; finished files are skipped.
-4. **Results:** you get `Transkripte-<date>.zip`, which contains `Transcripts/<course>/<date> – <title>.txt` plus `Overview.txt`, the list of what went where.
-5. **Optional:** *Lecture library → Import from Colab…* files the transcripts into the app. Lectures recorded with the app get the better transcript (your titles and bookmarks stay); iPad lectures are added as new lectures.
+**Once**
+1. **iPad → GoodNotes → Settings → Cloud & Backup → Auto-backup:** on, **Google Drive**, file format **Goodnotes**. A PDF backup leaves the recordings out.
+2. **Google Drive:** create a folder `Vorlesungen` and put your TraiNex `.ics` in it.
+3. **Recommended:** name each GoodNotes notebook after its module, e.g. *M13 Multivariate Verfahren*.
 
-Recordings are matched by their recording time: from the app, from the audio file's own metadata, from the GoodNotes file date, or from a date in the file name (e.g. `2026-10-06 at 13.52`). Anything that can't be matched goes to `Unsorted`.
+**Every time:** in the notebook, *Runtime → Run all*. Transcripts appear in Drive under `Vorlesungen/Transkripte/<course>/<date> – <title>.txt`, so you can read them on the iPad and the laptop.
+
+How it works:
+- **GoodNotes backups:** every recording inside every backed-up notebook is found. Notebooks grow all semester, so each recording is remembered by its fingerprint and transcribed only once. The backups themselves are only read, never changed.
+- **Course:** each recording is matched to the timetable event it overlaps most. The module code in the notebook name (*M13 …*) narrows that down, or decides on its own when there's no recording time. A recording paused and restarted in one lecture becomes one transcript (*Part 1 / Part 2*). Anything that can't be placed goes to `Unsorted`.
+- **Other recordings:** put them into `Vorlesungen/Inbox`. That covers laptop lectures via *Lecture library → Send to Colab…*, other audio files, and manual GoodNotes exports.
+- **Disconnects:** if Colab disconnects, run it again; finished recordings are skipped.
+- **Optional, Notion:** one page per lecture in a *Vorlesungs-Transkripte* database (course, date, type, lecturer). Setup is in the notebook's settings.
+- **Optional, laptop:** download the zip and use *Lecture library → Import from Colab…*.
 
 > This uploads recordings to Google. Skip sessions where patient cases are discussed.
 

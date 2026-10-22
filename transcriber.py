@@ -95,6 +95,23 @@ def clean_segment(text: str) -> str:
     return re.sub(r'\s{2,}', ' ', text).strip()
 
 
+def strip_prompt_echo(text: str, prompt: str | None) -> str:
+    """
+    Whisper repeats its prompt in quiet or noisy stretches ("M13 I. M13 I. …",
+    seen on a real seminar). Drop sentences made (almost) only of prompt words.
+    """
+    if not prompt or not text:
+        return text
+    vocab = set(re.findall(r"\w+", prompt.lower()))
+    kept = []
+    for sentence in re.split(r"(?<=[.!?…])\s+", text):
+        words = re.findall(r"\w+", sentence.lower())
+        if words and sum(w in vocab for w in words) / len(words) >= 0.6:
+            continue
+        kept.append(sentence)
+    return " ".join(kept).strip()
+
+
 # ─── Model registry ─────────────────────────────────────────
 
 # backend: "whisper" | "moonshine" | "sherpa-transducer" | "sherpa-sensevoice"
@@ -548,6 +565,7 @@ class Transcriber:
         cleaned = []
         for s, e, text in segments:
             text = clean_segment(text) if config.CLEAN_HALLUCINATIONS else text.strip()
+            text = strip_prompt_echo(text, prompt)
             if text:
                 cleaned.append((s, e, text))
         logger.info(
