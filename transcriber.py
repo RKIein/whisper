@@ -58,6 +58,7 @@ LECTURE_HALLUCINATION_PATTERNS = [
     r"(?i)untertitel (im auftrag|der amara|von|by)",
     r"(?i)amara\.org",
     r"(?i)^vielen dank f(ü|ue)r'?s? (zuschauen|zuhören)",
+    r"(?i)^vielen dank[.!]?$",       # alone in a quiet stretch: seen 8× in one real lecture
     r"(?i)^thank you( very much| so much)?[.!]?$",   # Whisper's filler for silence
 ]
 LECTURE_HALLUCINATION_RE = [re.compile(p) for p in LECTURE_HALLUCINATION_PATTERNS]

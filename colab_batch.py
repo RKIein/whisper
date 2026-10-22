@@ -212,7 +212,17 @@ def slide_text(path: str) -> str:
     try:
         import pypdf
     except ImportError:
-        return ""
+        # An already-open Colab notebook keeps its old setup cell, which didn't install pypdf
+        # (that's how the first run lost all umlaut fixes) — so fetch it here.
+        import subprocess
+        import sys
+        if not sys.platform.startswith("linux"):
+            return ""
+        subprocess.run([sys.executable, "-m", "pip", "install", "-q", "pypdf"], check=False)
+        try:
+            import pypdf
+        except ImportError:
+            return ""
     pages = []
     try:
         with zipfile.ZipFile(path) as z:
@@ -244,7 +254,11 @@ def fix_umlauts(title: str, slides: str) -> str:
             w = w.replace(a, b)
         if w == m.group(0):
             return w
-        return words.get(w.lower()) or words.get(w.lower().replace("ss", "ß")) or m.group(0)
+        for candidate in (w, w.replace("ss", "ß")):
+            found = words.get(candidate.lower())
+            if found:             # the slides' spelling, but not a heading's 'EFFEKTGRÖßEN'
+                return candidate if found[1:2].isupper() else found
+        return m.group(0)
     return _WORD.sub(fix, title)
 
 
