@@ -26,6 +26,7 @@ What comes out
 """
 
 import hashlib
+import io
 import json
 import os
 import re
@@ -33,6 +34,7 @@ import shutil
 import tempfile
 import time
 import zipfile
+from collections import Counter
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 
@@ -49,6 +51,7 @@ SR = 16000
 MIN_DURATION_S = 30          # skip accidental taps
 MIN_OVERLAP_S = 10 * 60      # how much a recording must overlap an event to count
 LOCAL_TZ = "Europe/Berlin"
+RESULT_VERSION = 2          # pending results older than this are transcribed again
 
 
 @dataclass
@@ -64,6 +67,7 @@ class Recording:
     time_source: str = ""
     duration_s: float = 0.0
     inbox_file: str | None = None    # move to Inbox/Done once done
+    slides: object = None            # () → text of the notebook's slide PDF ('' if none)
 
 
 # ─── Recording time ──────────────────────────────────────────
@@ -170,6 +174,7 @@ def _extractor(zip_path: str, member: str, work: str, ext: str):
 def from_goodnotes(path: str, work: str, skip=frozenset()) -> list[Recording]:
     """Every recording inside a GoodNotes document (zip). Skips keys in `skip` unread."""
     doc = os.path.splitext(os.path.basename(path))[0]
+    slides = _cached(lambda: slide_text(path))
     out = []
     with zipfile.ZipFile(path) as z:
         infos = [i for i in z.infolist() if not i.is_dir()]
@@ -186,11 +191,111 @@ def from_goodnotes(path: str, work: str, skip=frozenset()) -> list[Recording]:
                 continue
             rec = Recording(source=f"{os.path.basename(path)} › {os.path.basename(i.filename)}",
                             key=key, open=_extractor(path, i.filename, work, kind),
-                            label=f"{doc} {len(out) + 1}", doc=doc)
+                            label=f"{doc} {len(out) + 1}", doc=doc, slides=slides)
             if dated:
                 rec.time, rec.time_is_end, rec.time_source = datetime(*i.date_time), True, "GoodNotes file date, end"
             out.append(rec)
     return out
+
+
+def _cached(fn):
+    """fn() once, on first call (a notebook's slides are shared by its recordings)."""
+    box = []
+
+    def get():
+        if not box:
+            box.append(fn())
+        return box[0]
+    return get
+
+
+def slide_text(path: str) -> str:
+    """Text of the slide PDF(s) imported into a GoodNotes notebook ('' if none/unreadable)."""
+    try:
+        import pypdf
+    except ImportError:
+        return ""
+    pages = []
+    try:
+        with zipfile.ZipFile(path) as z:
+            for i in z.infolist():
+                if i.is_dir() or i.file_size < 1000:
+                    continue
+                with z.open(i) as f:
+                    if f.read(5) != b"%PDF-":
+                        continue
+                try:
+                    pages += [p.extract_text() or "" for p in pypdf.PdfReader(io.BytesIO(z.read(i))).pages]
+                except Exception:
+                    continue
+    except (OSError, zipfile.BadZipFile):
+        return ""
+    return "\n".join(pages)
+
+
+_WORD = re.compile(r"[A-Za-zÄÖÜäöüß][A-Za-zÄÖÜäöüß-]*[A-Za-zÄÖÜäöüß]")
+_CAPS_NOISE = {"UND", "ODER", "IM", "IN", "AM", "AN", "AUF", "DER", "DIE", "DAS", "DEN", "MIT",
+               "FÜR", "VON", "ZU", "ZUR", "ZUM", "BEI", "IST", "EIN", "THE", "AND", "OF", "TO",
+               "NACH", "PROF", "DR", "VL", "OPEN", "TEIL", "HMU"}
+# Everyday lecture words the model gets right anyway; they'd crowd out the real terms
+# (the hint holds only ~30 words).
+_GENERIC = {"vorlesung", "vorlesungen", "seminar", "methoden", "grundlagen", "einführung",
+            "informationen", "information", "entwicklung", "literatur", "inhalten", "inhalte",
+            "schritte", "personen", "psychologie", "psychologische", "psychologischen",
+            "psychologischer", "relevanter", "relevante", "beispiele", "beispiel", "übersicht",
+            "zusammenfassung", "diskussion", "einstellung", "bibliothek", "university",
+            "universität", "verfahren", "vertiefung", "organisatorisches", "wissenschaftliche",
+            "wissenschaftlichen", "fragestellung", "formulierung", "durchführung", "lernziele",
+            "anwesenheit", "teilnehmenden", "studierende", "studierenden", "aufgaben", "agenda"}
+
+
+def slide_terms(text: str, max_chars: int = 400) -> str:
+    """
+    Technical terms from lecture slides, as a vocabulary hint for the speech model:
+    long words ('Itemformulierung', 'disjunktiv'), hyphenated ones ('Likert-Skala') and
+    acronyms ('EFA'), most frequent first. '' if the slides have none.
+    """
+    count = Counter(_WORD.findall(text))
+    best: dict[str, str] = {}                     # lower-case → most frequent spelling
+    for w, n in count.most_common():
+        if w.isupper():                           # 'EFA', 'JASP' — not headings like 'ZIELE', 'UND'
+            ok = 2 <= len(w) <= 4 and w not in _CAPS_NOISE
+        elif "-" in w:                            # 'Likert-Skala', not 'Warm-Up', 'Ruhr-Uni'
+            ok = w[0].isupper() and all(len(p) >= 5 for p in w.split("-"))
+        elif w[0].isupper():                      # nouns: 'Itemformulierung', 'Datenerhebung'
+            ok = len(w) >= 8
+        else:                                     # 'disjunktiv' — not verbs ('hinzufügen')
+            ok = len(w) >= 10 and not w.endswith(("en", "ern", "eln"))
+        stem = w.lower()[:8]                      # Merkmal/Merkmale/Merkmalen → one
+        if ok and w.lower() not in _GENERIC and stem not in best:
+            best[stem] = w
+    # Half the room for the deck's recurring terms, half for its longest words: the
+    # specific compounds ('Routineverfahren', 'Datenerhebung') often appear only once.
+    frequent = list(best.values())
+    terms, size = [], 0
+    for pool, limit in ((frequent, max_chars // 2), (sorted(frequent, key=len, reverse=True), max_chars)):
+        for w in pool:
+            if w in terms:
+                continue
+            if size + len(w) + 2 > limit:
+                break
+            terms.append(w)
+            size += len(w) + 2
+    return ", ".join(terms) + "." if terms else ""
+
+
+def fix_umlauts(title: str, slides: str) -> str:
+    """'Einfuehrung' (file names avoid umlauts) → 'Einführung' when the slides spell it so."""
+    words = {w.lower(): w for w in _WORD.findall(slides)}
+
+    def fix(m):
+        w = m.group(0)
+        for a, b in (("ae", "ä"), ("oe", "ö"), ("ue", "ü"), ("Ae", "Ä"), ("Oe", "Ö"), ("Ue", "Ü")):
+            w = w.replace(a, b)
+        if w == m.group(0):
+            return w
+        return words.get(w.lower()) or words.get(w.lower().replace("ss", "ß")) or m.group(0)
+    return _WORD.sub(fix, title)
 
 
 def from_app_zip(path: str, work: str, skip=frozenset()) -> list[Recording]:
@@ -366,6 +471,8 @@ def plan(rec: Recording, events) -> dict:
     event = match(candidates, when, rec.duration_s, rec.time_is_end) if when else None
     meta = {"language": "auto", "bookmarks": [], "origin": "upload"}
     about = topic(rec.doc, event.course if event else (hint or ""))
+    if about and rec.slides:
+        about = fix_umlauts(about, rec.slides())
     about = f" – {about}" if about else ""
     if event:
         start = max(start, event.start - timedelta(minutes=30))
@@ -384,6 +491,11 @@ def plan(rec: Recording, events) -> dict:
         how = (f"no timetable event at {start:%d.%m.%Y %H:%M} ({rec.time_source})" if start
                else "no recording time found")
         group = f"rec:{rec.key}"
+    if rec.doc and start and meta["course"] != UNSORTED:
+        # One GoodNotes notebook = one slide deck = one topic. On block days the decks don't
+        # follow the timetable slots (3_Replikation began before the 11:30 slot), so a
+        # notebook's recordings of one day become one transcript, whatever the slot.
+        group = f"{meta['course']}|{rec.doc}|{start:%Y-%m-%d}"
     meta["started"] = start.strftime("%Y-%m-%dT%H:%M:%S") if start else ""
     stamp = start.strftime("%Y-%m-%d %H-%M") if start else "undated"
     return {"meta": meta, "folder": f"{stamp} – {store.safe_name(meta['title'], 'Recording')}",
@@ -398,18 +510,21 @@ def load_audio(path: str) -> np.ndarray:
 
 def transcribe(rec: Recording, events, engine, language: str | None = "de") -> dict:
     """Transcribe one recording → a result entry (kept in state until written out)."""
-    from transcriber import clean_segment              # repetition loops, silence fillers
+    from transcriber import clean_segment, strip_prompt_echo   # loops, fillers, echoed hints
     p = plan(rec, events)
     meta = p["meta"]
     audio = load_audio(rec.open())
     rec.duration_s = len(audio) / SR
 
     lang = meta.get("language") if meta.get("language") not in (None, "", "auto") else language
-    # No course-name prompt here: tested on a real seminar, large models repeat the prompt
-    # in noisy stretches ("M13 I. M13 I. …") and lose real speech around it.
+    # Vocabulary hint: the terms on this lecture's slides (Gütekriterien, Itemformulierung …),
+    # which the model otherwise mishears. Not the course name: a short code-like prompt
+    # ("M13 I") got repeated in noisy stretches; strip_prompt_echo drops any such echo.
+    prompt = slide_terms(rec.slides()) if rec.slides else ""
     t0 = time.time()
-    raw, detected = engine.transcribe(audio, lang, None)
-    segments = [(s, e, t) for s, e, t in ((s, e, clean_segment(t)) for s, e, t in raw) if t]
+    raw, detected = engine.transcribe(audio, lang, prompt or None)
+    segments = [(s, e, t) for s, e, t in
+                ((s, e, strip_prompt_echo(clean_segment(t), prompt)) for s, e, t in raw) if t]
 
     meta.update(duration_s=round(rec.duration_s, 1), detected_languages=[detected] if detected else [],
                 model=engine.name, transcribed_by="colab", status=store.STATUS_COMPLETE,
@@ -424,8 +539,9 @@ def transcribe(rec: Recording, events, engine, language: str | None = "de") -> d
     with open(os.path.join(session, store.TRANSCRIPT_MD), encoding="utf-8") as f:
         md = f.read()
     shutil.rmtree(session, ignore_errors=True)
-    return {"key": rec.key, "source": rec.source, "group": p["group"], "folder": p["folder"],
-            "how": p["how"], "meta": meta, "transcript_md": md,
+    how = p["how"] + (f" · {prompt.count(',') + 1} slide terms" if prompt else "")
+    return {"v": RESULT_VERSION, "key": rec.key, "source": rec.source, "group": p["group"],
+            "folder": p["folder"], "how": how, "meta": meta, "transcript_md": md,
             "minutes": round(rec.duration_s / 60), "seconds_taken": round(time.time() - t0)}
 
 
@@ -475,12 +591,39 @@ def lecture_text(parts: list[dict]) -> str:
     return "\n".join(out).rstrip() + "\n"
 
 
+MAX_PART_GAP_S = 60 * 60     # a notebook's recordings this far apart are separate lectures
+
+
+def _times(r: dict) -> tuple[datetime, datetime] | None:
+    try:
+        start = datetime.fromisoformat(r["meta"]["started"])
+    except (KeyError, ValueError):
+        return None
+    return start, start + timedelta(seconds=r["meta"].get("duration_s", 0))
+
+
 def lectures(results: list[dict]) -> list[list[dict]]:
-    """Group results by event, parts in time order."""
+    """
+    Group results into lectures (same event, or same notebook that day), parts in time
+    order. A notebook's recordings over an hour apart stay separate lectures; their
+    group gets a suffix so each result keeps pointing at its own transcript.
+    """
     groups: dict[str, list[dict]] = {}
     for r in results:
         groups.setdefault(r["group"], []).append(r)
-    out = [sorted(g, key=lambda r: r["meta"].get("started", "")) for g in groups.values()]
+    out = []
+    for g in groups.values():
+        g.sort(key=lambda r: r["meta"].get("started", ""))
+        clusters = [[g[0]]]
+        for r in g[1:]:
+            prev, this = _times(clusters[-1][-1]), _times(r)
+            if prev and this and (this[0] - prev[1]).total_seconds() > MAX_PART_GAP_S:
+                clusters.append([])
+            clusters[-1].append(r)
+        for n, cluster in enumerate(clusters[1:], 2):
+            for r in cluster:
+                r["group"] += f"#{n}"
+        out += clusters
     return sorted(out, key=lambda g: (g[0]["meta"]["course"], g[0]["meta"].get("started", "")))
 
 
@@ -564,6 +707,10 @@ def run(base: str, engine, language: str | None = "de", backup_folders=(), publi
     pending_path = os.path.join(state_dir, "pending.json")        # transcribed, not yet written
     processed = _load(processed_path, {})
     pending = _load(pending_path, [])
+    redo = [r for r in pending if r.get("v", 1) < RESULT_VERSION]
+    if redo:                      # done before slide hints / per-notebook grouping → once more
+        pending = [r for r in pending if r not in redo]
+        log(f"{len(redo)} recording(s) from an earlier version are transcribed again.")
 
     events = load_events(base)
     log(f"Timetable: {len(events)} events" if events else

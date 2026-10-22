@@ -105,6 +105,52 @@ def test_goodnotes_times_are_end_times():
     assert plans[0]["meta"]["title"] == "Vorlesung 06.10." and plans[0]["meta"]["kind"] == "Vorlesung"
 
 
+BLOCK_DAY_ICS = "BEGIN:VCALENDAR\r\n" + "".join(
+    "BEGIN:VEVENT\r\nSUMMARY:M13 I Multivariate Verfahren/Vorlesung - R0.0 (Hörsaal) - x\r\n"
+    f"DTSTART:20261009T{a}00\r\nDTEND:20261009T{b}00\r\nEND:VEVENT\r\n"
+    for a, b in (("0945", "1115"), ("1130", "1300"))) + "END:VCALENDAR\r\n"
+
+
+def test_block_day_groups_by_notebook():
+    """Robin's real 09.10.: the Replikation deck started at 10:55, before the 11:30 slot.
+    Its two recordings belong together — not with the Wiederholung deck of the 09:45 slot."""
+    events = cb.course_calendar.parse_ics(BLOCK_DAY_ICS)
+    folder = "M. Sc. Psychotherapie/M13 Multivariate Verfahren - Forschungsmethoden/"
+
+    def p(key, doc, h, m, mins):
+        return cb.plan(cb.Recording(source=key, key=key, open=None, label=key, doc=folder + doc,
+                                    time=cb.datetime(2026, 10, 9, h, m), time_is_end=True,
+                                    duration_s=mins * 60), events)
+    w1, w2 = p("w1", "2_Wiederholung_v06085.pdf", 10, 17, 36), p("w2", "2_Wiederholung_v06085.pdf", 10, 28, 11)
+    r1, r2 = p("r1", "3_Replikation_v17071.pdf", 11, 19, 24), p("r2", "3_Replikation_v17071.pdf", 12, 31, 61)
+    assert w1["group"] == w2["group"] and r1["group"] == r2["group"] != w1["group"]
+    assert r1["meta"]["title"] == "Vorlesung 09.10. – Replikation"
+    results = [{"group": x["group"], "meta": x["meta"], "transcript_md": ""} for x in (r2, w1, r1, w2)]
+    assert [[r["meta"]["started"][11:16] for r in g] for g in cb.lectures(results)] == \
+        [["09:41", "10:17"], ["10:55", "11:30"]]                       # parts in time order
+
+
+def test_slide_terms():
+    slides = ("Testkonstruktion\nGütekriterien der Testkonstruktion\nZIELE UND AUFGABEN\n"
+              "Itemformulierung: disjunktiv und vollständig, Likert-Skala, Warm-Up\n"
+              "Vorlesung Informationen EFA Merkmal Merkmale Merkmalen hinzufügen bearbeiten")
+    terms = cb.slide_terms(slides).rstrip(".").split(", ")
+    assert terms[0] == "Testkonstruktion"                              # most frequent first
+    assert {"Gütekriterien", "Itemformulierung", "disjunktiv", "Likert-Skala", "EFA"} <= set(terms)
+    for noise in ("ZIELE", "UND", "Warm-Up", "Vorlesung", "Informationen", "hinzufügen"):
+        assert noise not in terms
+    assert sum(t.startswith("Merkmal") for t in terms) <= 1
+    assert len(cb.slide_terms(" ".join(f"Fachbegriff{i:03d}" for i in range(200)))) <= 400
+    assert cb.slide_terms("") == ""
+
+
+def test_title_umlauts_from_slides():
+    slides = "Einführung und Grundlagen\nEffektgrößen"
+    assert cb.fix_umlauts("Einfuehrung und Grundlagen", slides) == "Einführung und Grundlagen"
+    assert cb.fix_umlauts("Effektgroessen", slides) == "Effektgrößen"
+    assert cb.fix_umlauts("neue aktuelle Quellen", slides) == "neue aktuelle Quellen"
+
+
 def test_topic_from_notebook_name():
     assert cb.topic("M13 …/3_Replikation_v17071.pdf") == "Replikation"
     assert cb.topic("M13 …/5_Datenqualitaet_v30439 2") == "Datenqualitaet"
@@ -266,6 +312,50 @@ def test_resume_after_disconnect(tmp_path):
     res = cb.run(base, engine, log=lambda *_: None)
     assert len(engine.calls) == 1                  # only the unfinished one
     assert len(res["transcripts"]) == 2
+
+
+def test_slide_terms_reach_the_model(tmp_path, monkeypatch):
+    base = str(tmp_path / "Vorlesungen")
+    os.makedirs(os.path.join(base, "Inbox"))
+    _goodnotes(os.path.join(base, "Inbox", "M4 Doku.goodnotes"), [("C1", 60, (2026, 10, 6, 9, 20, 0), 220)])
+    monkeypatch.setattr(cb, "slide_text", lambda path: "Qualitätssicherung Behandlungsdokumentation")
+
+    class Echoes(FakeEngine):
+        def transcribe(self, audio, language, prompt):
+            self.calls.append(prompt)
+            return [(0.0, 5.0, "Heute geht es um Qualitätssicherung."),
+                    (5.0, 9.0, "Qualitätssicherung, Behandlungsdokumentation.")], "de"   # echoed hint
+
+    engine = Echoes()
+    res = cb.run(base, engine, log=lambda *_: None)
+    assert engine.calls == ["Qualitätssicherung, Behandlungsdokumentation."]
+    text = open(res["transcripts"][0], encoding="utf-8").read()
+    assert "Heute geht es um Qualitätssicherung." in text and "Behandlungsdokumentation" not in text
+
+
+def test_results_of_an_older_version_are_redone(tmp_path):
+    base = str(tmp_path / "Vorlesungen")
+    os.makedirs(os.path.join(base, "Inbox"))
+    _goodnotes(os.path.join(base, "Inbox", "M4 Doku.goodnotes"),
+               [("C1", 60, (2026, 10, 6, 9, 20, 0), 220), ("C2", 60, (2026, 10, 6, 15, 59, 0), 300)])
+
+    class Dies(FakeEngine):
+        def transcribe(self, audio, language, prompt):
+            if self.calls:
+                raise KeyboardInterrupt
+            return super().transcribe(audio, language, prompt)
+    try:
+        cb.run(base, Dies(), log=lambda *_: None)
+    except KeyboardInterrupt:
+        pass
+    state = os.path.join(base, ".state", "pending.json")
+    pending = json.load(open(state, encoding="utf-8"))
+    for r in pending:
+        r.pop("v")                                     # as saved before slide hints
+    json.dump(pending, open(state, "w", encoding="utf-8"))
+    engine = FakeEngine()
+    cb.run(base, engine, log=lambda *_: None)
+    assert len(engine.calls) == 2                      # both again, not just the unfinished one
 
 
 def test_setup_error_stops_early(tmp_path):
