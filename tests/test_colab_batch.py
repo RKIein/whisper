@@ -268,6 +268,25 @@ def test_resume_after_disconnect(tmp_path):
     assert len(res["transcripts"]) == 2
 
 
+def test_setup_error_stops_early(tmp_path):
+    base = str(tmp_path / "Vorlesungen")
+    os.makedirs(os.path.join(base, "Inbox"))
+    _goodnotes(os.path.join(base, "Inbox", "M4 Doku.goodnotes"),
+               [(f"C{i}", 60, (2026, 10, 6, 9 + i, 20, 0), 200 + 50 * i) for i in range(5)])
+
+    class Broken(FakeEngine):
+        def transcribe(self, audio, language, prompt):
+            self.calls.append(1)
+            raise RuntimeError("Library libcublas.so.12 is not found or cannot be loaded")
+
+    engine = Broken()
+    res = cb.run(base, engine, log=lambda *_: None)
+    assert len(engine.calls) == 3 and res["failed"] == 3
+    assert os.path.exists(os.path.join(base, "Inbox", "M4 Doku.goodnotes"))
+    res = cb.run(base, FakeEngine(), log=lambda *_: None)    # fixed setup → all five still there
+    assert res["failed"] == 0 and len(res["transcripts"]) == 5
+
+
 class FakeNotion:
     """Records requests; behaves like the Notion API for what notion_export uses."""
 
