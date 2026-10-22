@@ -25,6 +25,8 @@ def test_silence_fillers_dropped():
     assert clean_segment("Thank you very much.") == ""
     assert clean_segment("... ... ...") == ""
     assert clean_segment("Thank you very much for the question, it shows") != ""
+    assert clean_segment("Vielen Dank.") == ""                 # 8× in one real lecture's pauses
+    assert clean_segment("Vielen Dank. Also, bei der Semi-Partialkorrelation ist es so") != ""
 
 
 def test_language_lock_settles_on_first_clear_chunk():

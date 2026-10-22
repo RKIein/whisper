@@ -135,6 +135,8 @@ def test_title_umlauts_from_slides():
     assert cb.fix_umlauts("Einfuehrung und Grundlagen", slides) == "Einführung und Grundlagen"
     assert cb.fix_umlauts("Effektgroessen", slides) == "Effektgrößen"
     assert cb.fix_umlauts("neue aktuelle Quellen", slides) == "neue aktuelle Quellen"
+    # Real M13 deck: the title word only appears as a heading in capitals
+    assert cb.fix_umlauts("Effektgroessen", "EFFEKTGRÖßEN\nEffektgröße") == "Effektgrößen"
 
 
 def test_topic_from_notebook_name():
