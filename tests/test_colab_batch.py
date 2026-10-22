@@ -1,4 +1,4 @@
-"""Round trip: app export → Colab batch (fake engine) → import into the library."""
+"""Colab batch: GoodNotes backups + Inbox → sorted transcripts (fake engine), app import, Notion."""
 
 import io
 import json
@@ -11,6 +11,7 @@ import numpy as np
 import colab_batch as cb
 import colab_exchange as cx
 import lecture_store as store
+import notion_export as nx
 from test_course_calendar import TRAINEX_ICS
 
 SR = 16000
@@ -28,37 +29,36 @@ class FakeEngine:
                 (31.0, 36.0, "Das ist so. Das ist so. Das ist so.")], language or "de"
 
 
-def _tone(seconds):
+def _tone(seconds, hz=220):
     t = np.arange(int(seconds * SR)) / SR
-    return (0.2 * np.sin(2 * np.pi * 220 * t)).astype(np.float32)
+    return (0.2 * np.sin(2 * np.pi * hz * t)).astype(np.float32)
 
 
-def _wav_bytes(seconds):
+def _wav_bytes(seconds, hz=220):
     buf = io.BytesIO()
     with wave.open(buf, "wb") as w:
         w.setnchannels(1)
         w.setsampwidth(2)
         w.setframerate(SR)
-        w.writeframes(store.float_to_int16(_tone(seconds)).tobytes())
+        w.writeframes(store.float_to_int16(_tone(seconds, hz)).tobytes())
     return buf.getvalue()
 
 
 def _mp3(path, seconds):
-    wav = path + ".wav"
-    with open(wav, "wb") as f:
+    with open(path + ".wav", "wb") as f:
         f.write(_wav_bytes(seconds))
-    store.encode_mp3(wav, path)
-    os.remove(wav)
+    store.encode_mp3(path + ".wav", path)
+    os.remove(path + ".wav")
 
 
-def _app_lecture(root):
-    path = store.create_session(root, "M13 I Multivariate Verfahren", "Seminar 1", "de")
-    _mp3(os.path.join(path, store.AUDIO_MP3), 70)
-    meta = store.load_meta(path)
-    meta.update(status=store.STATUS_AUDIO_ONLY, duration_s=70.0,
-                bookmarks=[{"t": 20.0, "label": "Bookmark"}])
-    store.save_meta(path, meta)
-    return path
+def _goodnotes(path, recordings):
+    """A GoodNotes-like zip: page data plus audio files without extensions.
+    recordings: [(member name, seconds, end time tuple, tone hz)]"""
+    with zipfile.ZipFile(path, "w") as z:
+        z.writestr(zipfile.ZipInfo("index.notes.pb", (2026, 9, 1, 9, 0, 0)), b"\x08\x01" * 10)
+        z.writestr(zipfile.ZipInfo("attachments/PDF-1", (2026, 9, 1, 9, 0, 0)), b"%PDF-1.7" + b"0" * 60000)
+        for name, seconds, end, hz in recordings:
+            z.writestr(zipfile.ZipInfo(f"attachments/{name}", end), _wav_bytes(seconds, hz))
 
 
 def test_time_from_name():
@@ -74,74 +74,167 @@ def test_tag_times_become_local():
     assert cb._parse_tag_time("1904-01-01T00:00:00Z") is None
 
 
-def test_round_trip(tmp_path):
-    root = str(tmp_path / "Lectures")
-    base = str(tmp_path / "Drive")
-    inbox = os.path.join(base, "Inbox")
-    os.makedirs(inbox)
+def test_course_hint_from_notebook_name():
+    events = cb.course_calendar.parse_ics(TRAINEX_ICS)
+    assert cb.course_hint("M13 Notizen WS26", events).startswith("M13 I Multivariate")
+    assert cb.course_hint("m4 Doku", events).startswith("M4 Dokumentation")
+    assert cb.course_hint("M130 something", events) is None
+    assert cb.course_hint("Mathe", events) is None
+
+
+def test_semester_flow(tmp_path):
+    root = str(tmp_path / "Lectures")             # the laptop app's library
+    drive = tmp_path / "MyDrive"
+    base = str(drive / "Vorlesungen")
+    backup = drive / "Goodnotes"
+    os.makedirs(os.path.join(base, "Inbox"))
+    os.makedirs(backup / "Studium")
     with open(os.path.join(base, "trainex.ics"), "w", encoding="utf-8") as f:
         f.write(TRAINEX_ICS)
+    assert cb.find_goodnotes_backup(str(drive)) == [str(backup)]
 
-    # 1. laptop recording, sent via "Send to Colab…"
-    app_session = _app_lecture(root)
+    # GoodNotes auto-backup. M8 VT on 06.10. 12:30–14:00, recorded in two parts (paused),
+    # plus an M5 seminar recording (15:30–17:00) sitting in a notebook named after M5.
+    m8 = str(backup / "Studium" / "M8 Basiskompetenzen.goodnotes")
+    _goodnotes(m8, [("A1", 60, (2026, 10, 6, 13, 10, 0), 220),
+                    ("A2", 60, (2026, 10, 6, 13, 55, 0), 330)])
+    m5 = str(backup / "Studium" / "M5 Diagnostik.goodnotes")
+    _goodnotes(m5, [("B1", 60, (2026, 10, 6, 16, 30, 0), 440)])
+    # Inbox: a laptop lecture via “Send to Colab”, a GoodNotes mp3 export with the time
+    # in its name (M4 lecture at 08:00), an undated file and an accidental tap.
+    app_session = store.create_session(root, "M13 I Multivariate Verfahren", "Seminar 1", "de")
+    _mp3(os.path.join(app_session, store.AUDIO_MP3), 70)
+    meta = store.load_meta(app_session)
+    meta.update(status=store.STATUS_AUDIO_ONLY, duration_s=70.0,
+                bookmarks=[{"t": 20.0, "label": "Bookmark"}])
+    store.save_meta(app_session, meta)
+    inbox = os.path.join(base, "Inbox")
     assert cx.export_for_colab(root, os.path.join(inbox, "Colab-Upload.zip")) == 1
-    # 2. GoodNotes mp3 export with the time in its name → M4 lecture at 08:00
     _mp3(os.path.join(inbox, "Aufnahme 2026-10-06 at 08.05.mp3"), 60)
-    # 3. GoodNotes document: audio without extension, file date = end of the M8 VT
-    gn = os.path.join(inbox, "Basiskompetenzen.goodnotes")
-    with zipfile.ZipFile(gn, "w") as z:
-        z.writestr(zipfile.ZipInfo("index.pb", (2026, 10, 1, 9, 0, 0)), b"\x08\x01")
-        z.writestr(zipfile.ZipInfo("attachments/A1B2", (2026, 10, 6, 13, 50, 0)), _wav_bytes(60))
-    # 4. no time anywhere → Unsorted
     _mp3(os.path.join(inbox, "Neue Aufnahme 12.mp3"), 45)
-    # 5. accidental 5-second recording → skipped
     _mp3(os.path.join(inbox, "oops.mp3"), 5)
 
     engine = FakeEngine()
-    log = []
-    zip_path = cb.run(base, engine, log=log.append)
-    assert zip_path and os.path.exists(zip_path)
-    assert sorted(os.listdir(inbox)) == ["Done"]                       # all moved
-    assert len(os.listdir(os.path.join(inbox, "Done"))) == 5
-    assert all(lang == "de" for _, lang, _ in engine.calls)
-    assert any(p and p.startswith("Vorlesung: M4") for _, _, p in engine.calls)
+    published = []
+    res = cb.run(base, engine, backup_folders=cb.find_goodnotes_backup(str(drive)),
+                 publish=published.append, log=lambda *_: None)
 
-    z = zipfile.ZipFile(zip_path)
-    names = z.namelist()
-    # The zip is just transcripts + an overview (+ the app's import file)
-    assert all(n.startswith("Transcripts/") or n in ("Overview.txt", cb.APP_IMPORT) for n in names)
-    assert not any(n.endswith((".mp3", ".srt", ".json")) for n in names if n != cb.APP_IMPORT)
-    overview = z.read("Overview.txt").decode("utf-8")
-    assert "? Transcripts/Unsorted/" in overview
-    m4_txt = next(n for n in names if n.startswith("Transcripts/M4 "))
-    text = z.read(m4_txt).decode("utf-8").replace("\r\n", "\n")
-    assert text.startswith("Vorlesung 06.10.\nM4 ")
-    assert "[00:00]  Heute geht es um Skalenniveaus." in text and "★ [00:20]" not in text
-    assert "---" not in text and "**" not in text
-    course_by_title = {e["meta"]["title"]: e["meta"]["course"]
-                       for e in json.loads(z.read(cb.APP_IMPORT))}
-    assert course_by_title["Vorlesung 06.10."].startswith("M4 ")
-    assert course_by_title["VT 06.10."].startswith("M8 ")
-    assert course_by_title["Neue Aufnahme 12"] == cb.UNSORTED
-    assert course_by_title["Seminar 1"].startswith("M13 ")
-    assert len(course_by_title) == 4                             # oops.mp3 skipped
+    # Inbox emptied, backups untouched
+    assert sorted(os.listdir(inbox)) == ["Done"] and len(os.listdir(os.path.join(inbox, "Done"))) == 4
+    assert os.path.exists(m8) and os.path.exists(m5)
+    # Transcripts straight into Drive, one per lecture
+    out = os.path.join(base, "Transkripte")
+    files = sorted(os.path.relpath(os.path.join(r, f), out).replace(os.sep, "/")
+                   for r, _, fs in os.walk(out) for f in fs)
+    assert len(files) == 5, files                  # M8 (2 parts → 1), M5, M4, M13, Unsorted
+    m8_txt = next(f for f in files if f.startswith("M8 "))
+    assert m8_txt.endswith("2026-10-06 – VT 06.10.txt")
+    text = open(os.path.join(out, m8_txt), encoding="utf-8").read()
+    assert text.count("— Part") == 2 and text.count("Skalenniveaus") == 2
+    assert text.count("Das ist so.") == 2          # repetition loops collapsed per part
+    assert any(f.startswith("M5 ") for f in files)  # notebook name + timetable
+    assert any(f.startswith("M4 ") and "Vorlesung 06.10." in f for f in files)
+    assert any(f.startswith("Unsorted/") for f in files)
+    assert res["unsorted"] == 1 and res["failed"] == 0
+    assert all(p is None for _, _, p in engine.calls)   # no prompt: large models echo it
+    assert len(published) == 1 and len(published[0]) == 5
 
-    # 6. import back into the library
-    new, updated = cx.import_results(root, zip_path)
-    assert (new, updated) == (3, 1)
+    # Results zip: transcripts + app import; laptop import updates/adds
+    z = zipfile.ZipFile(res["zip"])
+    assert all(n.startswith("Transcripts/") or n == cb.APP_IMPORT for n in z.namelist())
+    new, updated = cx.import_results(root, res["zip"])
+    assert (new, updated) == (5, 1)                # each GoodNotes part is its own app lecture
     meta = store.load_meta(app_session)
-    assert meta["transcribed_by"] == "colab" and meta["status"] == store.STATUS_COMPLETE
-    assert meta["title"] == "Seminar 1" and meta["bookmarks"][0]["t"] == 20.0   # kept
-    md = open(os.path.join(app_session, store.TRANSCRIPT_MD), encoding="utf-8").read()
-    assert "Skalenniveaus" in md and md.count("Das ist so.") == 1 and "🔖" in md
+    assert meta["transcribed_by"] == "colab" and meta["bookmarks"][0]["t"] == 20.0
 
-    courses = {c["name"]: c for c in store.list_courses(root)}
-    m4 = next(c for name, c in courses.items() if name.startswith("M4 "))
-    (lec,) = store.list_sessions(m4["path"])
-    assert lec["kind"] == "Vorlesung" and lec["lecturer"] == "Prof. Dr. Max Beispiel"
-    assert store.find_audio(lec["path"]) is None                 # transcript only
-    assert cb.UNSORTED in courses
+    # Next week: the M8 notebook has grown by one recording. Only that one is transcribed.
+    _goodnotes(m8, [("A1", 60, (2026, 10, 6, 13, 10, 0), 220),
+                    ("A2", 60, (2026, 10, 6, 13, 55, 0), 330),
+                    ("A3", 60, (2026, 10, 13, 13, 50, 0), 550)])
+    engine.calls.clear()
+    res2 = cb.run(base, engine, backup_folders=[str(backup)], log=lambda *_: None)
+    assert len(engine.calls) == 1 and len(res2["transcripts"]) == 1
+    assert "2026-10-13" in res2["transcripts"][0]
+    # Nothing new → nothing happens
+    assert cb.run(base, engine, backup_folders=[str(backup)], log=lambda *_: None)["zip"] is None
 
-    # nothing left to send, and an empty inbox does nothing
-    assert cx.pending_sessions(root) == []
-    assert cb.run(base, engine, log=log.append) is None
+
+def test_resume_after_disconnect(tmp_path):
+    base = str(tmp_path / "Vorlesungen")
+    os.makedirs(os.path.join(base, "Inbox"))
+    with open(os.path.join(base, "t.ics"), "w", encoding="utf-8") as f:
+        f.write(TRAINEX_ICS)
+    _goodnotes(os.path.join(base, "Inbox", "M4 Doku.goodnotes"),
+               [("C1", 60, (2026, 10, 6, 9, 20, 0), 220), ("C2", 60, (2026, 10, 6, 15, 59, 0), 300)])
+
+    class Dies(FakeEngine):
+        def transcribe(self, audio, language, prompt):
+            if self.calls:
+                raise KeyboardInterrupt            # Colab disconnects during the 2nd recording
+            return super().transcribe(audio, language, prompt)
+
+    try:
+        cb.run(base, Dies(), log=lambda *_: None)
+    except KeyboardInterrupt:
+        pass
+    assert os.path.exists(os.path.join(base, "Inbox", "M4 Doku.goodnotes"))   # not done yet
+    engine = FakeEngine()
+    res = cb.run(base, engine, log=lambda *_: None)
+    assert len(engine.calls) == 1                  # only the unfinished one
+    assert len(res["transcripts"]) == 2
+
+
+class FakeNotion:
+    """Records requests; behaves like the Notion API for what notion_export uses."""
+
+    def __init__(self):
+        self.pages, self.appends, self.dbs = [], [], []
+
+    def request(self, method, url, headers, json, timeout):
+        path = url.split("/v1", 1)[1]
+
+        class R:
+            status_code, headers_ = 200, {}
+
+            def __init__(self, data):
+                self._d = data
+                self.headers = {}
+
+            def json(self):
+                return self._d
+        if method == "POST" and path == "/databases":
+            self.dbs.append(json)
+            return R({"id": "db1"})
+        if method == "POST" and path.endswith("/query"):
+            key = json["filter"]["rich_text"]["equals"]
+            hits = [p for p in self.pages if p["properties"]["Schlüssel"]["rich_text"][0]["text"]["content"] == key]
+            return R({"results": hits})
+        if method == "POST" and path == "/pages":
+            self.pages.append(json)
+            return R({"id": f"page{len(self.pages)}"})
+        if method == "PATCH":
+            self.appends.append(json)
+            return R({})
+        raise AssertionError(path)
+
+
+def test_notion_publish():
+    assert nx.page_id_from_url("https://www.notion.so/Vorlesungen-1a2b3c4d5e6f40718293a4b5c6d7e8f9?pvs=4") \
+        == "1a2b3c4d-5e6f-4071-8293-a4b5c6d7e8f9"
+    md = "\n".join(f"**[00:{m:02d}:00]** Absatz {m} " + "x" * 2500 for m in range(60)) + "\n"
+    part = {"group": "M13 I Multivariate Verfahren, Forschung|2026-10-06T13:45", "key": "z:1",
+            "meta": {"title": "Seminar 06.10.", "course": "M13 I Multivariate Verfahren, Forschung",
+                     "kind": "Seminar", "lecturer": "Carolin Hey", "started": "2026-10-06T13:52:00",
+                     "duration_s": 3600}, "transcript_md": md}
+    fake = FakeNotion()
+    notion = nx.Notion("secret", session=fake)
+    db = nx.ensure_database(notion, "parent-page")
+    assert nx.publish([[part, dict(part, transcript_md=md)]], notion, db, cb.lecture_text) == 1
+    page = fake.pages[0]
+    assert page["properties"]["Kurs"]["select"]["name"] == "M13 I Multivariate Verfahren · Forschung"
+    assert page["properties"]["Dauer (min)"]["number"] == 120
+    body = page["children"] + [b for a in fake.appends for b in a["children"]]
+    assert len(page["children"]) == 100 and sum(b["type"] == "heading_3" for b in body) == 2
+    assert all(len(t["text"]["content"]) <= 2000 for b in body for t in b[b["type"]]["rich_text"])
+    # Second run: already there → not added again
+    assert nx.publish([[part]], notion, db, cb.lecture_text) == 0

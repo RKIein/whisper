@@ -46,6 +46,7 @@ HIDDEN_IMPORTS = [
     "ui",
     "audio_player",
     "colab_exchange",
+    "notion_export",
     "tkinter.filedialog",
     "lameenc",
 ]
