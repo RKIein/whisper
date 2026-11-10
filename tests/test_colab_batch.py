@@ -165,7 +165,7 @@ def test_preview_changes_nothing(tmp_path):
     text = open(res["preview"], encoding="utf-8").read()
     assert "VL_DMM_01 › R1" in text and "→ M5 Diagnostische Modelle" in text
     assert "folders" not in text and "VL_DMM_02" in text.split("without new recordings")[1]
-    assert os.listdir(os.path.join(base, "Inbox")) == ["Done", "x.mp3"]   # nothing moved
+    assert sorted(os.listdir(os.path.join(base, "Inbox"))) == ["Done", "x.mp3"]   # nothing moved
     assert not os.path.exists(os.path.join(base, ".state", "processed.json"))
     assert not os.path.exists(os.path.join(base, "Transkripte"))
 
@@ -438,3 +438,126 @@ def test_text_gaps_are_named_in_the_overview():
          "meta": {"course": "M13", "started": "2026-10-09T11:30:00", "gaps": [[1110, 1920]]}}
     text = cb.overview([r], [], {"g": "Transkripte/M13/x.txt"})
     assert "⚠ no text from 18:30 to 32:00 of this recording (14 min)" in text
+
+
+# ─── Recordings that reach Drive late or in pieces ──────────
+
+def _local_ts(*t):
+    from zoneinfo import ZoneInfo
+    from datetime import datetime
+    return datetime(*t, tzinfo=ZoneInfo(cb.LOCAL_TZ)).timestamp()
+
+
+def _slides_only(path):
+    with zipfile.ZipFile(path, "w") as z:
+        z.writestr("attachments/PDF", b"%PDF-1.7" + b"0" * 60000)
+
+
+def _two_weeks_ics():
+    def ev(course, kind, start, end):
+        return (f"BEGIN:VEVENT\nSUMMARY:{course}/{kind} - R0.0 (Hörsaal)  -  t25_abc21\n"
+                f"DTSTART:{start}\nDTEND:{end}\nEND:VEVENT\n")
+    return ("BEGIN:VCALENDAR\n"
+            + ev("M4 Dokumentation und Qualitätssicherung", "Vorlesung", "20261006T080000", "20261006T093000")
+            + ev("M5 Diagnostische Modelle & Methoden", "Seminar", "20261006T153000", "20261006T170000")
+            + ev("M5 Diagnostische Modelle & Methoden", "Seminar", "20261013T153000", "20261013T170000")
+            + ev("M13 Multivariate Verfahren", "Seminar", "20261005T113000", "20261005T130000")
+            + "END:VCALENDAR\n")
+
+
+def _setup(tmp_path, ics=None):
+    base = str(tmp_path / "Vorlesungen")
+    backup = tmp_path / "Goodnotes" / "Master"
+    os.makedirs(os.path.join(base, "Inbox"))
+    os.makedirs(backup)
+    with open(os.path.join(base, "t.ics"), "w", encoding="utf-8") as f:
+        f.write(ics or TRAINEX_ICS)
+    return base, backup
+
+
+def test_backup_taken_mid_lecture_is_reported(tmp_path):
+    from datetime import datetime
+    base, backup = _setup(tmp_path, _two_weeks_ics())
+    m4 = str(backup / "M4 Doku Termin 1.goodnotes")       # uploaded at 09:10, lecture until 09:30
+    _slides_only(m4)
+    os.utime(m4, (_local_ts(2026, 10, 6, 9, 10), _local_ts(2026, 10, 6, 9, 10)))
+    m13 = str(backup / "M13 Folien.goodnotes")             # uploaded after the seminar: not flagged
+    _slides_only(m13)
+    os.utime(m13, (_local_ts(2026, 10, 5, 15, 0), _local_ts(2026, 10, 5, 15, 0)))
+    m5 = str(backup / "M5 Diagnostik.goodnotes")           # recorded 06.10., not 13.10.
+    _goodnotes(m5, [("B1", 60, (2026, 10, 6, 16, 30, 0), 440)])
+    os.utime(m5, (_local_ts(2026, 10, 6, 17, 30), _local_ts(2026, 10, 6, 17, 30)))
+
+    res = cb.run(base, FakeEngine(), backup_folders=[str(backup.parent)], log=lambda *_: None,
+                 now=datetime(2026, 10, 14, 12, 0))
+    text = "\n".join(res["missing"])
+    assert "⏳ Master/M4 Doku Termin 1 — last uploaded 06.10. 09:10" in text
+    assert "the recording isn't in it yet" in text
+    assert "13.10. 15:30–17:00  M5 Seminar" in text and "no recording on Drive" in text
+    assert "M13" not in text                               # never recorded, uploaded after
+    assert "06.10. 15:30" not in text                      # transcribed
+    overview = next(f for f in os.listdir(os.path.join(base, "Results")) if f.startswith("Overview-"))
+    assert "Not on Drive yet:" in open(os.path.join(base, "Results", overview), encoding="utf-8").read()
+
+    # Nothing new next time: the report still comes, in the log and in an Overview
+    log = []
+    again = cb.run(base, FakeEngine(), backup_folders=[str(backup.parent)], log=log.append,
+                   now=datetime(2026, 10, 14, 12, 0))
+    assert again["zip"] is None and again["missing"] == res["missing"]
+    assert any("Not on Drive yet:" in line for line in log)
+
+
+def test_partial_upload_is_reported():
+    from datetime import datetime
+    events = cb.course_calendar.parse_ics(_two_weeks_ics())
+    import tempfile
+    with tempfile.TemporaryDirectory() as d:
+        nb = os.path.join(d, "M4 Doku.goodnotes")
+        _slides_only(nb)
+        os.utime(nb, (_local_ts(2026, 10, 6, 9, 18), _local_ts(2026, 10, 6, 9, 18)))
+        key = (store.safe_name("M4 Dokumentation und Qualitätssicherung"), "2026-10-06")
+        lines = cb.missing_report(events, [(nb, "M4 Doku")], {key: 33}, None, datetime(2026, 10, 7))
+        assert any("only 33 of 90 min are on Drive" in line for line in lines)
+        assert cb.missing_report(events, [(nb, "M4 Doku")], {key: 85}, None, datetime(2026, 10, 7)) == []
+
+
+def test_longer_version_of_a_recording_replaces_its_transcript(tmp_path):
+    base, backup = _setup(tmp_path)
+    nb = str(backup / "M4 Doku.goodnotes")
+    _goodnotes(nb, [("R1", 60, (2026, 10, 6, 8, 40, 0), 220)])   # uploaded mid-lecture
+    first = cb.run(base, FakeEngine(), backup_folders=[str(backup.parent)], log=lambda *_: None)
+    assert len(first["transcripts"]) == 1
+    assert "1 min" in open(first["transcripts"][0], encoding="utf-8").read().splitlines()[2]
+
+    _goodnotes(nb, [("R1", 180, (2026, 10, 6, 9, 25, 0), 220)])  # the full recording, later
+    log = []
+    second = cb.run(base, FakeEngine(), backup_folders=[str(backup.parent)], log=log.append)
+    folder = os.path.dirname(first["transcripts"][0])
+    assert os.listdir(folder) == [os.path.basename(second["transcripts"][0])]   # no "(2)"
+    assert "3 min" in open(second["transcripts"][0], encoding="utf-8").read().splitlines()[2]
+    processed = json.load(open(os.path.join(base, ".state", "processed.json"), encoding="utf-8"))
+    assert sorted(v.get("skipped", "file") for v in processed.values()) == \
+        ["file", "replaced by a longer version"]
+    assert any(line.startswith("↻ ") for line in "\n".join(log).splitlines())
+    assert cb.run(base, FakeEngine(), backup_folders=[str(backup.parent)], log=lambda *_: None)["zip"] is None
+
+
+def test_late_part_is_joined_to_the_lecture(tmp_path):
+    base, backup = _setup(tmp_path)
+    nb = str(backup / "M4 Doku.goodnotes")
+    earlier = ("P0", 60, (2026, 9, 29, 8, 45, 0), 110)              # last week, same notebook
+    p1 = ("P1", 60, (2026, 10, 6, 8, 45, 0), 220)
+    _goodnotes(nb, [earlier, p1])                                   # uploaded during the break
+    first = cb.run(base, FakeEngine(), backup_folders=[str(backup.parent)], log=lambda *_: None)
+    assert len(first["transcripts"]) == 2
+
+    _goodnotes(nb, [earlier, p1, ("P2", 60, (2026, 10, 6, 9, 25, 0), 330)])   # second half, later
+    engine = FakeEngine()
+    second = cb.run(base, engine, backup_folders=[str(backup.parent)], log=lambda *_: None)
+    assert len(engine.calls) == 2                                   # P2 + P1 redone, not P0
+    out = os.path.join(base, "Transkripte")
+    files = sorted(f for _, _, fs in os.walk(out) for f in fs)
+    assert len(files) == 2 and not any("(2)" in f for f in files)
+    text = open(second["transcripts"][0], encoding="utf-8").read()
+    assert "— Part 1" in text and "— Part 2" in text
+    assert cb.run(base, FakeEngine(), backup_folders=[str(backup.parent)], log=lambda *_: None)["zip"] is None

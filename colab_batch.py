@@ -66,6 +66,8 @@ class Recording:
     duration_s: float = 0.0
     inbox_file: str | None = None    # move to Inbox/Done once done
     slides: object = None            # () → text of the notebook's slide PDF ('' if none)
+    replaces: list = field(default_factory=list)   # keys of shorter versions of this recording
+    redo: bool = False               # already transcribed; redone to join a late part
 
 
 # ─── Recording time ──────────────────────────────────────────
@@ -640,7 +642,8 @@ def overview(results: list[dict], errors: list[dict], files: dict[str, str]) -> 
     """Which recording became which transcript, and what needs a look."""
     lines = [f"Transcribed {datetime.now():%d.%m.%Y %H:%M}", ""]
     for r in sorted(results, key=lambda r: (r["meta"]["course"], r["meta"].get("started", ""))):
-        mark = "?" if r["meta"]["course"] == UNSORTED else "✓"
+        mark = "?" if r["meta"]["course"] == UNSORTED else (
+            "↻" if r.get("replaces") or r.get("redo") else "✓")
         lines.append(f"{mark} {files.get(r['group'], '')}   ← {r['source']} ({r['how']})")
         for a, b in r["meta"].get("gaps", []):
             lines.append(f"      ⚠ no text from {_mmss(a)} to {_mmss(b)} of this recording "
@@ -650,7 +653,132 @@ def overview(results: list[dict], errors: list[dict], files: dict[str, str]) -> 
     if any(r["meta"]["course"] == UNSORTED for r in results):
         lines += ["", "“?” = no course found (no recording time, nothing scheduled then, and no",
                   "module code like “M13” in the GoodNotes notebook name)."]
+    if any(r.get("replaces") or r.get("redo") for r in results):
+        lines += ["", "“↻” = replaces the earlier transcript of this lecture: more of the recording",
+                  "had reached Drive since (GoodNotes had uploaded it mid-lecture)."]
     return "\n".join(lines) + "\n"
+
+
+# ─── What isn't on Drive yet ─────────────────────────────────
+
+LOOKBACK_DAYS = 14           # lectures this recent without a transcript are listed
+PARTIAL_SHARE = 0.6          # less than this share of a lecture transcribed → “only part”
+_MINUTES = re.compile(r"·\s*(\d+)\s*min\b")
+
+
+def _uploaded_at(path: str) -> datetime:
+    """When the file reached Drive (its mtime on the Drive mount), local time."""
+    return _to_local(datetime.fromtimestamp(os.path.getmtime(path), tz=timezone.utc))
+
+
+def _transcribed(base: str, processed: dict, results: list[dict]) -> dict:
+    """(course folder, date) → minutes transcribed, from earlier runs and this one."""
+    out: dict[tuple[str, str], float] = {}
+    files: dict[str, float] = {}
+    for v in processed.values():
+        f = v.get("file")
+        if not f:
+            continue
+        if "minutes" in v:
+            files[f] = files.get(f, 0) + v["minutes"]
+        elif f not in files:      # saved before minutes were remembered: read the header
+            try:
+                with open(os.path.join(base, f), encoding="utf-8") as fh:
+                    head = "".join(fh.readline() for _ in range(3))
+                m = _MINUTES.search(head)
+                files[f] = float(m.group(1)) if m else 0.0
+            except OSError:
+                files[f] = 0.0
+    for f, minutes in files.items():
+        parts = f.replace("\\", "/").split("/")
+        if len(parts) >= 3 and parts[-2] != UNSORTED:
+            key = (parts[-2], parts[-1][:10])
+            out[key] = out.get(key, 0) + minutes
+    for r in results:
+        course, day = r["meta"].get("course", UNSORTED), r["meta"].get("started", "")[:10]
+        if course != UNSORTED and day:
+            key = (store.safe_name(course), day)
+            out[key] = out.get(key, 0) + r["meta"].get("duration_s", 0) / 60
+    return out
+
+
+_KIND = re.compile(r"^\d{4}-\d\d-\d\d – (.+?) \d\d\.\d\d\.")
+
+
+def _recorded(processed: dict, results: list[dict]) -> set:
+    """(course folder, kind) you record — e.g. M5 lectures but not its seminars."""
+    out = set()
+    for v in processed.values():
+        parts = v.get("file", "").split("/")
+        if len(parts) >= 3 and parts[-2] != UNSORTED:
+            m = _KIND.match(parts[-1])
+            out.add((parts[-2], m.group(1) if m else None))
+    for r in results:
+        if r["meta"].get("course", UNSORTED) != UNSORTED:
+            out.add((store.safe_name(r["meta"]["course"]), r["meta"].get("kind")))
+    return out
+
+
+def _slot(e) -> str:
+    return f"{e.start:%d.%m.} {e.start:%H:%M}–{e.end:%H:%M}  {e.short_label}"
+
+
+def missing_report(events, notebooks: list[tuple[str, str]], transcribed: dict,
+                   since: datetime | None, now: datetime, recorded: set | None = None) -> list[str]:
+    """
+    What should be on Drive but isn't (yet):
+      ⏳ notebooks GoodNotes last uploaded *during* their lecture — the recording was still
+         running, so it isn't in the backup (or only its first part is);
+      –  recent lectures of the kinds you record (course + Vorlesung/Seminar/…) that
+         have no transcript at all.
+    notebooks: (path, name inside the backup) of every GoodNotes backup file.
+    recorded: (course folder, kind) pairs you record; kind None = any kind of that course.
+    """
+    lectures_ = [e for e in events if e.end - e.start < timedelta(hours=12) and e.start <= now]
+    flagged, lines = set(), []
+    for path, name in notebooks:
+        course = course_hint(name, events)
+        if not course:
+            continue
+        try:
+            up = _uploaded_at(path)
+        except OSError:
+            continue
+        if since and up < since:
+            continue
+        for e in lectures_:
+            if e.course != course or not (e.start - timedelta(minutes=30) <= up <= e.end + timedelta(minutes=10)):
+                continue
+            done = transcribed.get((store.safe_name(e.course), f"{e.start:%Y-%m-%d}"), 0)
+            length = (e.end - e.start).total_seconds() / 60
+            if done >= PARTIAL_SHARE * length:
+                continue
+            flagged.add((e.course, e.start.date()))
+            what = (f"only {done:.0f} of {length:.0f} min are on Drive" if done
+                    else "the recording isn't in it yet")
+            lines.append(f"⏳ {name} — last uploaded {up:%d.%m. %H:%M}, during {_slot(e)}: {what}.")
+            break
+    if recorded is None:
+        recorded = {(c, None) for c, _ in transcribed}
+    for e in lectures_:
+        if e.end > now or e.end < now - timedelta(days=LOOKBACK_DAYS):
+            continue
+        course = store.safe_name(e.course)
+        if (course, e.kind) not in recorded and (course, None) not in recorded:
+            continue
+        if (e.course, e.start.date()) in flagged:
+            continue
+        if (store.safe_name(e.course), f"{e.start:%Y-%m-%d}") in transcribed:
+            continue
+        flagged.add((e.course, e.start.date()))
+        lines.append(f"–  {_slot(e)}: no recording on Drive")
+    if not lines:
+        return []
+    return ["Not on Drive yet:", *lines, "",
+            "GoodNotes uploads a notebook while you're still recording, and not always again",
+            "afterwards. Open these notebooks on the iPad (on Wi‑Fi) for a minute so GoodNotes",
+            "uploads the finished recording, then run this again. Or share the recording from",
+            "GoodNotes into Vorlesungen/Inbox."]
 
 
 # ─── Run ─────────────────────────────────────────────────────
@@ -679,7 +807,7 @@ def _save(path, data):
 
 def run(base: str, engine, language: str | None = "de", backup_folders=(), publish=None,
         log=print, since="semester", only_folder: str = "", preview: bool = False,
-        again: bool = False, app_zip: bool = True) -> dict:
+        again: bool = False, app_zip: bool = True, now: datetime | None = None) -> dict:
     """
     preview=True only lists what was found and where it would go (Results/Preview-….txt);
     nothing is transcribed, moved or remembered.
@@ -695,9 +823,17 @@ def run(base: str, engine, language: str | None = "de", backup_folders=(), publi
     count only if their notebook name has a module code from the timetable.
     only_folder limits the backup to one GoodNotes folder. The Inbox is never filtered.
 
+    GoodNotes uploads a notebook while it's still recording. So a recording can reach
+    Drive in pieces: first nothing or its first part, the rest after a later upload.
+    A longer version of a transcribed recording replaces it, and a late part is joined
+    to the parts already transcribed (they're redone) — one file per lecture, no “(2)”.
+    What isn't on Drive yet is listed under “Not on Drive yet” (see missing_report).
+
     publish(groups) is called with the finished lectures (e.g. Notion upload).
-    Returns {"transcripts": [paths], "zip": path or None, "unsorted": n, "failed": n}.
+    Returns {"transcripts": [paths], "zip": path or None, "unsorted": n, "failed": n,
+    "missing": [lines]}.
     """
+    now = now or datetime.now()
     inbox, results_dir = os.path.join(base, "Inbox"), os.path.join(base, "Results")
     done, state_dir = os.path.join(inbox, "Done"), os.path.join(base, ".state")
     out_dir = os.path.join(base, "Transkripte")
@@ -730,6 +866,14 @@ def run(base: str, engine, language: str | None = "de", backup_folders=(), publi
     skip = {k for k, v in processed.items() if not (again and "file" in v)} | {r["key"] for r in pending}
     sources = [(p, False) for p in backup_files(list(backup_folders), only_folder)] + \
               [(p, True) for p in inbox_files(inbox)]
+
+    def notebooks_in_backup() -> list[tuple[str, str]]:
+        out = []
+        for p, is_inbox in sources:
+            root = next((b for b in backup_folders if not is_inbox and p.startswith(b)), None)
+            if root:
+                out.append((p, os.path.splitext(os.path.relpath(p, root))[0].replace(os.sep, "/")))
+        return out
     work = tempfile.mkdtemp(prefix="lectures-")
     todo: list[Recording] = []
     errors = []
@@ -758,6 +902,47 @@ def run(base: str, engine, language: str | None = "de", backup_folders=(), publi
                 todo.append(r)
         if is_inbox and not recs and not preview:
             shutil.move(path, os.path.join(done, os.path.basename(path)))
+    # The same GoodNotes recording, longer now (it was still running at the last upload):
+    # its new version replaces the old transcript.
+    by_source = {v["source"]: k for k, v in processed.items() if "file" in v and "source" in v}
+    for r in todo:
+        old_key = by_source.get(r.source)
+        if old_key and old_key != r.key:
+            r.replaces.append(old_key)
+    # A late part of a lecture whose earlier parts are already transcribed: redo those
+    # parts too, so all of them end up in one transcript. Only notebooks with something
+    # new are re-read, and only parts from the same day (checked again after probing).
+    exclude = {k for r in todo for k in r.replaces} | {r.key for r in todo}
+    new_days: dict[str, set] = {}
+    for r in todo:
+        if r.doc and not r.inbox_file and not r.meta:
+            new_days.setdefault(r.doc, set()).add(r.time.date() if r.time else None)
+    for path, is_inbox in sources:
+        if is_inbox:
+            continue
+        root = next((b for b in backup_folders if path.startswith(b)), None)
+        doc = os.path.splitext(os.path.relpath(path, root))[0].replace(os.sep, "/") if root else ""
+        if doc not in new_days:
+            continue
+        days = new_days[doc]
+        siblings = {k for k, v in processed.items()
+                    if "file" in v and v.get("source", "").startswith(f"{doc} › ")
+                    and k not in exclude
+                    and (None in days or any(f"/{d:%Y-%m-%d} " in "/" + v["file"].split("/")[-1]
+                                             for d in days))}
+        if not siblings:
+            continue
+        try:
+            for r in collect(path, work, skip - siblings):
+                if r.key not in siblings:
+                    continue
+                r.doc = doc
+                r.source = f"{doc} › {r.source.split(' › ')[-1]}"
+                r.redo = True
+                todo.append(r)
+        except Exception as e:
+            errors.append({"source": os.path.basename(path), "error": f"can't open: {e}"})
+
     if old and not preview:
         _save(processed_path, processed)
     if since:
@@ -768,6 +953,7 @@ def run(base: str, engine, language: str | None = "de", backup_folders=(), publi
 
     failed_files = set()
     pending_before = len(pending)
+    new_groups = {r["group"] for r in pending}
     for n, rec in enumerate(todo, 1):
         try:
             audio_path = rec.open()
@@ -781,6 +967,8 @@ def run(base: str, engine, language: str | None = "de", backup_folders=(), publi
                     rec.time_source = "GoodNotes, end of recording" if gn else "audio metadata"
                 elif rec.time is None and time_from_name(rec.label):
                     rec.time, rec.time_source = time_from_name(rec.label), "file name"
+            if rec.redo and plan(rec, events)["group"] not in new_groups:
+                continue                          # an earlier part of another lecture: keep it
             if preview:
                 when = f"{rec.time:%d.%m.%Y %H:%M} ({rec.time_source})" if rec.time else "no time"
                 size = os.path.getsize(audio_path) / 1e6
@@ -788,7 +976,9 @@ def run(base: str, engine, language: str | None = "de", backup_folders=(), publi
                     found.append(f"–  {rec.source}   {when} → skip, earlier semester")
                 else:
                     p = plan(rec, events)
-                    found.append(f"{'?' if p['meta']['course'] == UNSORTED else '✓'}  {rec.source}   "
+                    new_groups.add(p["group"])
+                    mark = "↻" if rec.replaces or rec.redo else ("?" if p["meta"]["course"] == UNSORTED else "✓")
+                    found.append(f"{mark}  {rec.source}   "
                                  f"{rec.duration_s / 60:.0f} min, {size:.1f} MB, {when}\n"
                                  f"     → {p['meta']['course']} / {p['meta']['title']}   [{p['how']}]")
                 continue
@@ -801,7 +991,9 @@ def run(base: str, engine, language: str | None = "de", backup_folders=(), publi
             else:
                 log(f"[{n}/{len(todo)}] {rec.source} ({rec.duration_s / 60:.0f} min)…")
                 r = transcribe(rec, events, engine, language)
+                r["replaces"], r["redo"] = rec.replaces, rec.redo
                 pending.append(r)
+                new_groups.add(r["group"])
                 log(f"      → {r['meta']['course']} / {r['meta']['title']}   "
                     f"[{r['how']}, {r['seconds_taken']} s]")
             _save(pending_path, pending)
@@ -832,23 +1024,39 @@ def run(base: str, engine, language: str | None = "de", backup_folders=(), publi
                 + (f"\nNotebooks without new recordings ({len(empty)}):\n" + "\n".join(f"   {e}" for e in empty)
                    + "\n" if empty else "")
                 + "".join(f"\n✗ {e['source']}: {e['error']}" for e in errors))
+        missing = missing_report(events, notebooks_in_backup(), _transcribed(base, processed, []),
+                                 since, now, _recorded(processed, []))
+        if missing:
+            text += "\n" + "\n".join(missing) + "\n"
         path = os.path.join(results_dir, f"Preview-{datetime.now():%Y-%m-%d-%H%M}.txt")
         with open(path, "w", encoding="utf-8") as f:
             f.write(text)
         _prune(results_dir, "Preview-")
         log("\n" + text)
-        return {"transcripts": [], "zip": None, "unsorted": 0, "failed": len(errors), "preview": path}
+        return {"transcripts": [], "zip": None, "unsorted": 0, "failed": len(errors),
+                "preview": path, "missing": missing}
 
     if not pending:
         for e in errors:
             log(f"✗ {e['source']}: {e['error']}")
         log("Nothing new to transcribe." if not errors else "Nothing transcribed.")
-        return {"transcripts": [], "zip": None, "unsorted": 0, "failed": len(errors)}
+        missing = missing_report(events, notebooks_in_backup(), _transcribed(base, processed, []),
+                                 since, now, _recorded(processed, []))
+        if missing:
+            text = f"Checked {datetime.now():%d.%m.%Y %H:%M} — nothing new to transcribe\n\n" \
+                   + "\n".join(missing) + "\n"
+            with open(os.path.join(results_dir, f"Overview-{datetime.now():%Y-%m-%d-%H%M}.txt"), "w",
+                      encoding="utf-8") as f:
+                f.write(text)
+            _prune(results_dir, "Overview-")
+            log("\n" + text)
+        return {"transcripts": [], "zip": None, "unsorted": 0, "failed": len(errors), "missing": missing}
 
-    for r in pending:             # transcribed again: the new file replaces the old one
-        old = processed.get(r["key"], {}).get("file")
-        if old and os.path.exists(os.path.join(base, old)):
-            os.remove(os.path.join(base, old))
+    for r in pending:             # transcribed again, longer now, or joined by a late part:
+        for k in [r["key"], *r.get("replaces", [])]:     # the new file replaces the old one
+            old = processed.get(k, {}).get("file")
+            if old and os.path.exists(os.path.join(base, old)):
+                os.remove(os.path.join(base, old))
     groups = lectures(pending)
     paths = write_transcripts(groups, out_dir)
     files = {g[0]["group"]: os.path.relpath(p, base).replace(os.sep, "/") for g, p in zip(groups, paths)}
@@ -867,15 +1075,21 @@ def run(base: str, engine, language: str | None = "de", backup_folders=(), publi
             z.writestr(APP_IMPORT, json.dumps(
                 [{"folder": r["folder"], "meta": r["meta"], "transcript_md": r["transcript_md"]}
                  for r in pending], ensure_ascii=False))
+    for r in pending:
+        processed[r["key"]] = {"file": files[r["group"]], "source": r["source"], "minutes": r["minutes"]}
+        for k in r.get("replaces", []):
+            processed[k] = {"skipped": "replaced by a longer version", "by": r["key"]}
+    missing = missing_report(events, notebooks_in_backup(), _transcribed(base, processed, []), since, now,
+                             _recorded(processed, []))
     text = overview(pending, errors, files)
+    if missing:
+        text += "\n" + "\n".join(missing) + "\n"
     with open(os.path.join(results_dir, f"Overview-{datetime.now():%Y-%m-%d-%H%M}.txt"), "w",
               encoding="utf-8") as f:
         f.write(text)
     for prefix in ("Overview-", "Transkripte-"):
         _prune(results_dir, prefix)
 
-    for r in pending:
-        processed[r["key"]] = {"file": files[r["group"]], "source": r["source"]}
     _save(processed_path, processed)
     os.remove(pending_path)
 
@@ -883,7 +1097,8 @@ def run(base: str, engine, language: str | None = "de", backup_folders=(), publi
     log("\n" + text)
     log(f"Done: {len(groups)} transcript(s) in {os.path.basename(base)}/Transkripte, "
         f"{unsorted} unsorted, {len(errors)} failed.")
-    return {"transcripts": paths, "zip": zip_path, "unsorted": unsorted, "failed": len(errors)}
+    return {"transcripts": paths, "zip": zip_path, "unsorted": unsorted, "failed": len(errors),
+            "missing": missing}
 
 
 # ─── Engine (Colab GPU) ──────────────────────────────────────

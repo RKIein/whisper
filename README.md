@@ -149,6 +149,7 @@ How it works:
 - **Course:** each recording is matched to the timetable event it overlaps most. The module code in the notebook name (*M13 …*) narrows that down, or decides on its own when there's no recording time. A recording paused and restarted in one lecture becomes one transcript (*Part 1 / Part 2*). Anything that can't be placed goes to `Unsorted`.
 - **Other recordings:** put them into `Vorlesungen/Inbox`. That covers laptop lectures via *Lecture library → Send to Colab…*, other audio files, and manual GoodNotes exports.
 - **Disconnects:** if Colab disconnects, run it again; finished recordings are skipped.
+- **Missing lectures:** GoodNotes uploads a notebook while you're still recording, and not always again afterwards, so the recording can be missing from Drive or only partly there. Each run lists these under **Not on Drive yet** in the Overview: notebooks uploaded mid-lecture, and recent lectures of the kinds you record that have no transcript. Open those notebooks on the iPad (on Wi‑Fi) for a minute so GoodNotes uploads them again, then run it again. When the rest of a recording arrives, its transcript is **replaced** (↻), not duplicated.
 - **Optional, Notion:** one page per lecture in a *Vorlesungs-Transkripte* database (course, date, type, lecturer). Setup is in the notebook's settings.
 - **Optional, laptop:** download the zip and use *Lecture library → Import from Colab…*.
 
