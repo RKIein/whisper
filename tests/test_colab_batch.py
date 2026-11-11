@@ -584,3 +584,38 @@ def test_late_goodnotes_stamp_uses_the_courses_only_event_that_day():
         "DTSTART:20261006T100000\nDTEND:20261006T113000\nEND:VEVENT\nEND:VCALENDAR\n")
     r2 = p(events + extra)
     assert r2["meta"]["title"].startswith("Recording 06.10.") and "lecturer" not in r2["meta"]
+
+
+# ─── Slides with notes ───────────────────────────────────────
+
+def test_slides_with_notes_next_to_the_transcript(tmp_path):
+    import pytest
+    pytest.importorskip("pymupdf")
+    from test_goodnotes_pdf import build_notebook
+    base, backup = _setup(tmp_path)
+    nb = str(backup / "M4 Doku.goodnotes")
+    build_notebook(nb, audio=("R1", _wav_bytes(60), (2026, 10, 6, 9, 20, 0)))
+    os.makedirs(backup / "M5")
+    slides_only = str(backup / "M5" / "VL_DMM_01_Grundlagen.goodnotes")
+    build_notebook(slides_only, text=False)
+
+    res = cb.run(base, FakeEngine(), backup_folders=[str(backup.parent)], log=lambda *_: None)
+    transcript = res["transcripts"][0]
+    pdf = transcript[:-len(".txt")] + " – Folien.pdf"
+    assert os.path.exists(pdf), os.listdir(os.path.dirname(transcript))
+    import pymupdf
+    assert pymupdf.open(pdf).page_count == 2
+    m5 = os.path.join(base, "Transkripte", store.safe_name("M5 Diagnostische Modelle & Methoden"))
+    assert os.listdir(m5) == ["VL DMM 01 Grundlagen – Folien.pdf"]
+    assert len(res["slides"]) == 3 and res["slides"][0] == "Slides with notes:"
+
+    # Unchanged → not made again; changed → replaced, still one file
+    again = cb.run(base, FakeEngine(), backup_folders=[str(backup.parent)], log=lambda *_: None)
+    assert again["slides"] == []
+    build_notebook(nb, strokes=((100.0, 100.0, 1.5), (100.0, 300.0, 1.5)),
+                   audio=("R1", _wav_bytes(60), (2026, 10, 6, 9, 20, 0)))
+    os.utime(nb, (os.path.getmtime(nb) + 60, os.path.getmtime(nb) + 60))
+    third = cb.run(base, FakeEngine(), backup_folders=[str(backup.parent)], log=lambda *_: None)
+    assert len(third["slides"]) == 2 and "2 pen strokes" in third["slides"][1]
+    assert sorted(f for f in os.listdir(os.path.dirname(transcript)) if f.endswith(".pdf")) == \
+        [os.path.basename(pdf)]
