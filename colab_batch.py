@@ -435,6 +435,15 @@ def plan(rec: Recording, events) -> dict:
     hint = course_hint(rec.doc or rec.label, events)
     candidates = [e for e in events if e.course == hint] if hint else events
     event = match(candidates, when, rec.duration_s, rec.time_is_end) if when else None
+    same_day = False
+    if event is None and hint and start:
+        # GoodNotes sometimes stamps a recording hours after it ended (M1, 04.11.: 14:30 for
+        # the 09:45–11:15 lecture). The notebook says which course; if that course had just
+        # one event that day, it's that one.
+        day = [e for e in candidates
+               if e.start.date() == start.date() and e.end - e.start < timedelta(hours=12)]
+        if len(day) == 1:
+            event, same_day = day[0], True
     meta = {"language": "auto", "bookmarks": [], "origin": "upload"}
     about = topic(rec.doc, event.course if event else (hint or ""))
     if about and rec.slides:
@@ -445,7 +454,8 @@ def plan(rec: Recording, events) -> dict:
         meta.update(course=event.course, title=f"{event.kind or 'Lecture'} {event.start:%d.%m.}{about}",
                     kind=event.kind, lecturer=event.lecturer, room=event.room,
                     calendar=event.to_meta())
-        how = f"timetable ({rec.time_source})" + (" + GoodNotes folder/name" if hint else "")
+        how = (f"timetable (only {event.kind or 'event'} that day; {rec.time_source} fits no slot)"
+               if same_day else f"timetable ({rec.time_source})") + (" + GoodNotes folder/name" if hint else "")
         group = f"{event.course}|{event.start:%Y-%m-%dT%H:%M}"
     elif hint:
         meta.update(course=hint, title=f"Recording {start:%d.%m.}{about}" if start else rec.label)
