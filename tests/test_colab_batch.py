@@ -561,3 +561,26 @@ def test_late_part_is_joined_to_the_lecture(tmp_path):
     text = open(second["transcripts"][0], encoding="utf-8").read()
     assert "— Part 1" in text and "— Part 2" in text
     assert cb.run(base, FakeEngine(), backup_folders=[str(backup.parent)], log=lambda *_: None)["zip"] is None
+
+
+def test_late_goodnotes_stamp_uses_the_courses_only_event_that_day():
+    """M1, 04.11.: the 09:45–11:15 lecture came stamped 14:30 (77 min) — no slot overlaps.
+    The notebook's folder says M4 here; M4 has one event that day → that's the lecture."""
+    events = cb.course_calendar.parse_ics(TRAINEX_ICS)            # M4 06.10. 08:00–09:30
+
+    def p(evs):
+        return cb.plan(cb.Recording(source="k", key="k", open=None, label="k",
+                                    doc="M. Sc. Psychotherapie/M4 Qualitätssicherung/M4_M6_Termin_1",
+                                    time=cb.datetime(2026, 10, 6, 14, 30), time_is_end=True,
+                                    duration_s=77 * 60), evs)
+    r = p(events)
+    assert r["meta"]["title"] == "Vorlesung 06.10."
+    assert r["meta"]["lecturer"] == "Prof. Dr. Max Beispiel" and r["meta"]["room"]
+    assert "only Vorlesung that day" in r["how"]
+
+    # Two M4 events that day: no guessing
+    extra = cb.course_calendar.parse_ics(
+        "BEGIN:VCALENDAR\nBEGIN:VEVENT\nSUMMARY:M4 Dokumentation und Qualitätssicherung/Seminar - R1.0  -  t25\n"
+        "DTSTART:20261006T100000\nDTEND:20261006T113000\nEND:VEVENT\nEND:VCALENDAR\n")
+    r2 = p(events + extra)
+    assert r2["meta"]["title"].startswith("Recording 06.10.") and "lecturer" not in r2["meta"]
