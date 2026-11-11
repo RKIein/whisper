@@ -20,6 +20,8 @@ How each recording is sorted
 
 What comes out
   <base>/Transkripte/<course>/<date> – <title>.txt   readable transcripts
+  <base>/Transkripte/<course>/<date> – <title> – Folien.pdf
+                                                     slides + your GoodNotes notes
   <base>/Results/Transkripte-<date>.zip              same + app-import.json
                                                      (“Import from Colab…”)
   optionally a Notion page per lecture (notion_export.py)
@@ -793,6 +795,95 @@ def missing_report(events, notebooks: list[tuple[str, str]], transcribed: dict,
 
 # ─── Run ─────────────────────────────────────────────────────
 
+# ─── Slides with notes ───────────────────────────────────────
+
+SLIDES_SUFFIX = " – Folien.pdf"
+
+
+def _ensure_pymupdf(log=print) -> bool:
+    import importlib.util
+    if importlib.util.find_spec("pymupdf"):
+        return True
+    import subprocess
+    import sys
+    log("Installing PyMuPDF for the slides…")
+    r = subprocess.run([sys.executable, "-m", "pip", "install", "-q", "pymupdf"],
+                       capture_output=True, text=True)
+    if r.returncode != 0:
+        log(f"⚠ Slides skipped: PyMuPDF couldn't be installed ({r.stderr.strip()[-200:]})")
+        return False
+    importlib.invalidate_caches()
+    return True
+
+
+def slides_target(name: str, processed: dict, events) -> str:
+    """Where a notebook's slides go (relative to base): next to its lecture's transcript,
+    or — several lectures or none — named after the notebook in its course folder."""
+    files = sorted({v["file"] for v in processed.values()
+                    if "file" in v and v.get("source", "").startswith(f"{name} › ")})
+    notebook = store.safe_name(re.split(r"[\\/]", name)[-1].replace("_", " ").strip(), "Notebook")
+    if len(files) == 1:
+        return files[0][:-len(".txt")] + SLIDES_SUFFIX if files[0].endswith(".txt") else files[0] + SLIDES_SUFFIX
+    if files:
+        return f"{os.path.dirname(files[-1])}/{notebook}{SLIDES_SUFFIX}"
+    course = course_hint(name, events) or UNSORTED
+    return f"Transkripte/{store.safe_name(course)}/{notebook}{SLIDES_SUFFIX}"
+
+
+def export_slides(base: str, notebooks: list[tuple[str, str]], processed: dict, events,
+                  log=print) -> list[str]:
+    """
+    One PDF per GoodNotes notebook: its slides with your handwriting and text boxes
+    (goodnotes_pdf). Only notebooks of a course in the timetable or with a transcript,
+    and only when the notebook changed (or its transcript moved). Returns Overview lines.
+    """
+    import goodnotes_pdf
+    state_path = os.path.join(base, ".state", "slides.json")
+    state = _load(state_path, {})
+    todo = []
+    for path, name in notebooks:
+        try:
+            sig = f"{os.path.getsize(path)}-{int(os.path.getmtime(path))}"
+        except OSError:
+            continue
+        target = slides_target(name, processed, events)
+        if f"/{UNSORTED}/" in f"/{target}" and not course_hint(name, events):
+            continue                              # not a notebook of this timetable
+        old = state.get(name, {})
+        if old.get("sig") == sig and (old.get("pdf") is None or
+                                      (old.get("pdf") == target and os.path.exists(os.path.join(base, target)))):
+            continue
+        todo.append((path, name, sig, target, old.get("pdf")))
+    if not todo:
+        return []
+    if not _ensure_pymupdf(log):
+        return ["⚠ Slides with notes skipped: PyMuPDF missing."]
+    lines = []
+    for path, name, sig, target, old_pdf in todo:
+        dest = os.path.join(base, target)
+        try:
+            os.makedirs(os.path.dirname(dest), exist_ok=True)
+            tmp = os.path.join(tempfile.gettempdir(), f"slides-{hashlib.sha1(name.encode()).hexdigest()[:10]}.pdf")
+            pages = goodnotes_pdf.read_notebook(path)
+            if not pages:                         # not a GoodNotes 6 notebook we can read
+                state[name] = {"sig": sig, "pdf": None}
+                _save(state_path, state)
+                continue
+            stats = goodnotes_pdf.render(pages, path, tmp)
+            shutil.move(tmp, dest)
+            if old_pdf and old_pdf != target and os.path.exists(os.path.join(base, old_pdf)):
+                os.remove(os.path.join(base, old_pdf))
+            state[name] = {"sig": sig, "pdf": target}
+            _save(state_path, state)
+            note = f", {stats['skipped']} element(s) not drawn" if stats["skipped"] else ""
+            lines.append(f"📄 {target}  ({stats['pages']} pages, {stats['strokes']} pen strokes, "
+                         f"{stats['texts']} text boxes{note})")
+        except Exception as e:
+            lines.append(f"⚠ Slides for {name} failed: {e}")
+    log(f"Slides with notes: {sum(1 for l in lines if l.startswith('📄'))} PDF(s) new or updated.")
+    return ["Slides with notes:", *lines]
+
+
 def _prune(folder: str, prefix: str, keep: int = 3) -> None:
     """Only the newest `keep` run files (Overview-…, Preview-…, Transkripte-….zip) stay."""
     names = sorted(n for n in os.listdir(folder) if n.startswith(prefix))   # dated names sort by time
@@ -817,13 +908,16 @@ def _save(path, data):
 
 def run(base: str, engine, language: str | None = "de", backup_folders=(), publish=None,
         log=print, since="semester", only_folder: str = "", preview: bool = False,
-        again: bool = False, app_zip: bool = True, now: datetime | None = None) -> dict:
+        again: bool = False, app_zip: bool = True, now: datetime | None = None,
+        slides: bool = True) -> dict:
     """
     preview=True only lists what was found and where it would go (Results/Preview-….txt);
     nothing is transcribed, moved or remembered.
     again=True transcribes backup recordings already done once more (after an improvement);
     their old transcript files are replaced, not kept next to the new ones.
     app_zip=False skips the zip for the laptop app's “Import from Colab…”.
+    slides=True also saves each GoodNotes notebook's slides with your notes as a PDF next
+    to its transcript (“… – Folien.pdf”, see export_slides), re-made when it changes.
 
     Transcribe everything new in <base>/Inbox and the GoodNotes backup folder(s).
 
@@ -1052,15 +1146,17 @@ def run(base: str, engine, language: str | None = "de", backup_folders=(), publi
         log("Nothing new to transcribe." if not errors else "Nothing transcribed.")
         missing = missing_report(events, notebooks_in_backup(), _transcribed(base, processed, []),
                                  since, now, _recorded(processed, []))
-        if missing:
+        slide_lines = export_slides(base, notebooks_in_backup(), processed, events, log) if slides else []
+        if missing or slide_lines:
             text = f"Checked {datetime.now():%d.%m.%Y %H:%M} — nothing new to transcribe\n\n" \
-                   + "\n".join(missing) + "\n"
+                   + "\n".join(missing + ([""] if missing and slide_lines else []) + slide_lines) + "\n"
             with open(os.path.join(results_dir, f"Overview-{datetime.now():%Y-%m-%d-%H%M}.txt"), "w",
                       encoding="utf-8") as f:
                 f.write(text)
             _prune(results_dir, "Overview-")
             log("\n" + text)
-        return {"transcripts": [], "zip": None, "unsorted": 0, "failed": len(errors), "missing": missing}
+        return {"transcripts": [], "zip": None, "unsorted": 0, "failed": len(errors), "missing": missing,
+                "slides": slide_lines}
 
     for r in pending:             # transcribed again, longer now, or joined by a late part:
         for k in [r["key"], *r.get("replaces", [])]:     # the new file replaces the old one
@@ -1091,9 +1187,12 @@ def run(base: str, engine, language: str | None = "de", backup_folders=(), publi
             processed[k] = {"skipped": "replaced by a longer version", "by": r["key"]}
     missing = missing_report(events, notebooks_in_backup(), _transcribed(base, processed, []), since, now,
                              _recorded(processed, []))
+    slide_lines = export_slides(base, notebooks_in_backup(), processed, events, log) if slides else []
     text = overview(pending, errors, files)
     if missing:
         text += "\n" + "\n".join(missing) + "\n"
+    if slide_lines:
+        text += "\n" + "\n".join(slide_lines) + "\n"
     with open(os.path.join(results_dir, f"Overview-{datetime.now():%Y-%m-%d-%H%M}.txt"), "w",
               encoding="utf-8") as f:
         f.write(text)
@@ -1108,7 +1207,7 @@ def run(base: str, engine, language: str | None = "de", backup_folders=(), publi
     log(f"Done: {len(groups)} transcript(s) in {os.path.basename(base)}/Transkripte, "
         f"{unsorted} unsorted, {len(errors)} failed.")
     return {"transcripts": paths, "zip": zip_path, "unsorted": unsorted, "failed": len(errors),
-            "missing": missing}
+            "missing": missing, "slides": slide_lines}
 
 
 # ─── Engine (Colab GPU) ──────────────────────────────────────
