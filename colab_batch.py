@@ -816,12 +816,26 @@ def _ensure_pymupdf(log=print) -> bool:
     return True
 
 
+_COPY_SUFFIX = re.compile(r"(?: \d{1,2}| \(\d{1,2}\)|[ _](?:kopie|copy))+$", re.I)   # not '_2' (Termin_2)
+
+
+def _notebook_base(name: str) -> str:
+    """'…/5_Datenqualitaet_v30439.pdf' and its copy '…/5_Datenqualitaet_v30439 2' → same key."""
+    stem = re.sub(r"\.pdf$", "", name, flags=re.I)
+    return _COPY_SUFFIX.sub("", stem).lower()
+
+
+def _has_transcript(name: str, processed: dict) -> bool:
+    return any("file" in v and v.get("source", "").startswith(f"{name} › ") for v in processed.values())
+
+
 def slides_target(name: str, processed: dict, events) -> str:
     """Where a notebook's slides go (relative to base): next to its lecture's transcript,
     or — several lectures or none — named after the notebook in its course folder."""
     files = sorted({v["file"] for v in processed.values()
                     if "file" in v and v.get("source", "").startswith(f"{name} › ")})
-    notebook = store.safe_name(re.split(r"[\\/]", name)[-1].replace("_", " ").strip(), "Notebook")
+    shown = re.sub(r"\.pdf$", "", re.split(r"[\\/]", name)[-1], flags=re.I)   # '5_…v30439.pdf'
+    notebook = store.safe_name(shown.replace("_", " ").strip(), "Notebook")
     if len(files) == 1:
         return files[0][:-len(".txt")] + SLIDES_SUFFIX if files[0].endswith(".txt") else files[0] + SLIDES_SUFFIX
     if files:
@@ -840,8 +854,18 @@ def export_slides(base: str, notebooks: list[tuple[str, str]], processed: dict, 
     import goodnotes_pdf
     state_path = os.path.join(base, ".state", "slides.json")
     state = _load(state_path, {})
-    todo = []
+    # A copied notebook ('… 2', '… Kopie') holding the recording supersedes its untouched
+    # original: only the copy gets a PDF, and one already made for the original goes.
+    with_transcript = {_notebook_base(n) for _, n in notebooks if _has_transcript(n, processed)}
+    todo, lines = [], []
     for path, name in notebooks:
+        if not _has_transcript(name, processed) and _notebook_base(name) in with_transcript:
+            old_pdf = state.pop(name, {}).get("pdf")
+            if old_pdf and os.path.exists(os.path.join(base, old_pdf)):
+                os.remove(os.path.join(base, old_pdf))
+                lines.append(f"–  {old_pdf} removed: the copy of this notebook with the recording has the slides")
+            _save(state_path, state)
+            continue
         try:
             sig = f"{os.path.getsize(path)}-{int(os.path.getmtime(path))}"
         except OSError:
@@ -855,10 +879,9 @@ def export_slides(base: str, notebooks: list[tuple[str, str]], processed: dict, 
             continue
         todo.append((path, name, sig, target, old.get("pdf")))
     if not todo:
-        return []
+        return ["Slides with notes:", *lines] if lines else []
     if not _ensure_pymupdf(log):
         return ["⚠ Slides with notes skipped: PyMuPDF missing."]
-    lines = []
     for path, name, sig, target, old_pdf in todo:
         dest = os.path.join(base, target)
         try:
@@ -876,11 +899,11 @@ def export_slides(base: str, notebooks: list[tuple[str, str]], processed: dict, 
             state[name] = {"sig": sig, "pdf": target}
             _save(state_path, state)
             note = f", {stats['skipped']} element(s) not drawn" if stats["skipped"] else ""
-            lines.append(f"📄 {target}  ({stats['pages']} pages, {stats['strokes']} pen strokes, "
+            lines.append(f"PDF: {target}  ({stats['pages']} pages, {stats['strokes']} pen strokes, "
                          f"{stats['texts']} text boxes{note})")
         except Exception as e:
             lines.append(f"⚠ Slides for {name} failed: {e}")
-    log(f"Slides with notes: {sum(1 for l in lines if l.startswith('📄'))} PDF(s) new or updated.")
+    log(f"Slides with notes: {sum(1 for l in lines if l.startswith('PDF: '))} PDF(s) new or updated.")
     return ["Slides with notes:", *lines]
 
 

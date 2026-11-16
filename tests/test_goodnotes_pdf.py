@@ -67,7 +67,7 @@ def uuid(n: int) -> str:
 
 
 def build_notebook(path, pdf_pages=2, strokes=((100.0, 100.0, 1.5),), text=True, audio=None,
-                   color=(0.9, 0.1, 0.1, 1.0), page0=b""):
+                   color=(0.9, 0.1, 0.1, 1.0), page0=b"", extra=()):
     """Two slide pages in reverse sort order; page 'slide 2' carries the notes."""
     src = pymupdf.open()
     for n in range(pdf_pages):
@@ -87,6 +87,7 @@ def build_notebook(path, pdf_pages=2, strokes=((100.0, 100.0, 1.5),), text=True,
         rgba = msg((1, color[0]), (2, color[1]), (3, color[2]), (4, color[3]))
         el = msg((1, f"S{k}"), (2, tpl_blob(start, segs, compress=k % 2 == 0)), (3, 1), (4, rgba))
         elements += [msg((1, f"S{k}"), (2, msg((1, 1)))), msg((7, el))]
+    elements += list(extra)
     if text:
         frame = msg((1, msg((1, 500.0), (2, 800.0))), (2, msg((1, 400.0), (2, 43.0))))
         elements += [msg((1, "T0"), (2, msg((1, 1)))), msg((8, msg((1, "T0"), (3, frame), (6, RTF))))]
@@ -125,7 +126,7 @@ def test_render_draws_slides_strokes_and_text(tmp_path):
     nb, out = str(tmp_path / "VL.goodnotes"), str(tmp_path / "VL.pdf")
     build_notebook(nb)
     stats = g.notebook_to_pdf(nb, out)
-    assert stats == {"pages": 2, "strokes": 1, "texts": 1, "skipped": 0}
+    assert stats == {"pages": 2, "strokes": 1, "texts": 1, "skipped": 0, "erased": 0}
     doc = pymupdf.open(out)
     assert doc.page_count == 2 and doc[0].rect.width == 1320
     assert "Slide 1" in doc[0].get_text() and "Slide 2" in doc[1].get_text()
@@ -154,3 +155,39 @@ def test_unknown_elements_are_skipped_not_fatal(tmp_path):
 def test_rtf_text():
     text, size, color = g.rtf_text(RTF)
     assert text == "Klausurrelevant —>" and size == 18 and color[2] > 0.5
+
+
+def erased_stroke(el_id="E0") -> list:
+    """What GoodNotes keeps of a stroke you rubbed out: the element, no points (field 14 = 1)."""
+    body = struct.pack("<H", 2) + struct.pack("<I", 0) * 3
+    sig = b"vA(v)A(u)A(u)\x00"
+    data = b"tpl\x00" + struct.pack("<I", 8 + len(sig) + len(body)) + sig + body
+    blob = b"bv4-" + struct.pack("<I", len(data)) + data + b"bv4$"
+    return [msg((1, el_id), (2, msg((1, 1)))), msg((7, msg((1, el_id), (2, blob), (3, 1), (14, 1))))]
+
+
+def test_erased_strokes_and_header_ids_dont_break_the_notebook(tmp_path):
+    """Old notebooks (Oct 2026) failed whole: rubbed-out strokes and plain-ID header entries."""
+    nb, out = str(tmp_path / "Old.goodnotes"), str(tmp_path / "Old.pdf")
+    header_with_id = msg((1, "H0"), (4, "31B69721-83BE-41E4-8953-000000000000"))   # not an element
+    build_notebook(nb, text=False, extra=[*erased_stroke("E0"), *erased_stroke("E1"), header_with_id])
+    pages = g.read_notebook(nb)
+    assert len(pages[1].strokes) == 1 and pages[1].erased == 2 and pages[1].skipped == 0
+    stats = g.notebook_to_pdf(nb, out)
+    assert stats["strokes"] == 1 and stats["erased"] == 2 and stats["skipped"] == 0
+
+
+def test_a_stroke_that_cant_be_drawn_costs_only_itself(tmp_path, monkeypatch):
+    nb, out = str(tmp_path / "S.goodnotes"), str(tmp_path / "S.pdf")
+    build_notebook(nb, strokes=((100.0, 100.0, 1.5), (100.0, 300.0, 1.5)))
+    real = g._draw_stroke
+    calls = []
+
+    def flaky(page, s):
+        calls.append(1)
+        if len(calls) == 1:
+            raise ValueError("odd stroke")
+        real(page, s)
+    monkeypatch.setattr(g, "_draw_stroke", flaky)
+    stats = g.notebook_to_pdf(nb, out)
+    assert stats["strokes"] == 1 and stats["skipped"] == 1 and stats["texts"] == 1

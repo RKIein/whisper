@@ -619,3 +619,27 @@ def test_slides_with_notes_next_to_the_transcript(tmp_path):
     assert len(third["slides"]) == 2 and "2 pen strokes" in third["slides"][1]
     assert sorted(f for f in os.listdir(os.path.dirname(transcript)) if f.endswith(".pdf")) == \
         [os.path.basename(pdf)]
+
+
+def test_slides_names_and_copied_notebooks(tmp_path):
+    """'5_Datenqualitaet_v30439.pdf' + its copy '… 2' with the recording: only the copy gets
+    slides (next to its transcript); a PDF made earlier for the original is removed."""
+    import pytest
+    pytest.importorskip("pymupdf")
+    from test_goodnotes_pdf import build_notebook
+    base, backup = _setup(tmp_path)
+    folder = backup / "M4 Doku"
+    os.makedirs(folder)
+    original = str(folder / "5_Datenqualitaet_v30439.pdf.goodnotes")
+    build_notebook(original, text=False)
+    first = cb.run(base, FakeEngine(), backup_folders=[str(backup.parent)], log=lambda *_: None)
+    m4 = os.path.join(base, "Transkripte", store.safe_name("M4 Dokumentation und Qualitätssicherung"))
+    assert os.listdir(m4) == ["5 Datenqualitaet v30439 – Folien.pdf"]          # no '.pdf' inside
+    assert first["slides"][1].startswith("PDF: ")
+
+    copy = str(folder / "5_Datenqualitaet_v30439 2.goodnotes")
+    build_notebook(copy, audio=("R1", _wav_bytes(60), (2026, 10, 6, 9, 20, 0)))
+    res = cb.run(base, FakeEngine(), backup_folders=[str(backup.parent)], log=lambda *_: None)
+    transcript = os.path.basename(res["transcripts"][0])
+    assert sorted(os.listdir(m4)) == sorted([transcript, transcript[:-4] + " – Folien.pdf"])
+    assert any("removed" in line for line in res["slides"])
