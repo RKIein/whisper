@@ -64,6 +64,16 @@ def fields(b: bytes) -> list[tuple[int, object]]:
     return out
 
 
+def safe_fields(b) -> list | None:
+    """fields(b), or None if b isn't a protobuf message (e.g. a plain ID string)."""
+    if not isinstance(b, bytes):
+        return None
+    try:
+        return fields(b)
+    except (ValueError, IndexError, struct.error):
+        return None
+
+
 def first(b: bytes, num: int, default=None):
     for f, v in fields(b):
         if f == num:
@@ -193,16 +203,24 @@ class Page:
     strokes: list = field(default_factory=list)
     texts: list = field(default_factory=list)
     skipped: int = 0                 # elements of kinds not drawn
+    erased: int = 0                  # strokes you erased (GoodNotes keeps an empty stub)
 
 
 TOOL_PEN = 1
 
 
-def parse_stroke(el: bytes) -> Stroke:
+def parse_stroke(el: bytes) -> Stroke | None:
+    """A pen/highlighter stroke, or None for an erased one (no points left)."""
     f = dict(fields(el))
+    if not isinstance(f.get(2), bytes):
+        return None
     geom = tpl(apple_decompress(f[2]))
+    if len(geom) < 4 or not isinstance(geom[2], list) or not isinstance(geom[3], list):
+        return None                               # another layout: only seen empty so far
     start, flat = geom[2], geom[3]
-    pts = [tuple(flat[k:k + 3]) for k in range(0, len(flat) - len(flat) % 3, 3)]
+    if len(start) != 3 or len(flat) % 6:
+        return None                               # erased: GoodNotes keeps the element, empty
+    pts = [tuple(flat[k:k + 3]) for k in range(0, len(flat), 3)]
     segments = list(zip(pts[0::2], pts[1::2]))
     rgba = dict(fields(f[4])) if isinstance(f.get(4), bytes) else {}
     color = tuple(float(rgba.get(k, 0.0)) for k in (1, 2, 3))
@@ -251,10 +269,13 @@ def page_elements(data: bytes, page: Page):
     latest: dict[str, tuple[int, bytes]] = {}
     order = []
     for rec in records(data):
-        for f, v in fields(rec):
+        for f, v in safe_fields(rec) or []:
             if not isinstance(v, bytes) or f in (1, 2):
                 continue
-            el_id = _text(first(v, 1, b"")) or f"#{len(order)}"
+            inner = safe_fields(v)
+            if inner is None:                     # header entries hold plain IDs, not elements
+                continue
+            el_id = _text(dict(inner).get(1, b"")) or f"#{len(order)}"
             if el_id not in latest:
                 order.append(el_id)
             latest[el_id] = (f, v)
@@ -262,7 +283,11 @@ def page_elements(data: bytes, page: Page):
         kind, el = latest[el_id]
         try:
             if kind == 7:
-                page.strokes.append(parse_stroke(el))
+                stroke = parse_stroke(el)
+                if stroke is None:
+                    page.erased += 1
+                else:
+                    page.strokes.append(stroke)
             elif kind == 8:
                 tb = parse_textbox(el)
                 if tb:
@@ -271,6 +296,20 @@ def page_elements(data: bytes, page: Page):
                 page.skipped += 1
         except Exception:
             page.skipped += 1
+
+
+def _event(kind: int, f: dict, backgrounds: dict, attachments: dict, pages: dict):
+    """One index.events.pb record: page background (2), attachment (6) or page (54)."""
+    if kind == 2:
+        size = dict(fields(f[8])) if isinstance(f.get(8), bytes) else {}
+        backgrounds[_text(f.get(2))] = (_text(f.get(4)), int(f.get(5, 0) or 0),
+                                        float(size.get(1, 0)), float(size.get(2, 0)))
+    elif kind == 6:
+        attachments[_text(f.get(1))] = _text(f.get(2))
+    elif kind == 54:
+        bg = _text(first(f[3], 1, b"")) if isinstance(f.get(3), bytes) else ""
+        key = _text(first(f[4], 1, b"")) if isinstance(f.get(4), bytes) else ""
+        pages[_text(f.get(2))] = (key, bg)
 
 
 def _uuid_plus_one(u: str) -> str:
@@ -289,20 +328,17 @@ def read_notebook(path: str) -> list[Page]:
         events = z.read("index.events.pb") if "index.events.pb" in names else b""
         backgrounds, attachments, pages = {}, {}, {}
         for rec in records(events):
-            for kind, body in fields(rec):
+            for kind, body in safe_fields(rec) or []:
                 if kind == 1 or not isinstance(body, bytes):
                     continue
-                f = dict(fields(body))
-                if kind == 2:
-                    size = dict(fields(f[8])) if isinstance(f.get(8), bytes) else {}
-                    backgrounds[_text(f.get(2))] = (_text(f.get(4)), int(f.get(5, 0) or 0),
-                                                    float(size.get(1, 0)), float(size.get(2, 0)))
-                elif kind == 6:
-                    attachments[_text(f.get(1))] = _text(f.get(2))
-                elif kind == 54:
-                    bg = _text(first(f[3], 1, b"")) if isinstance(f.get(3), bytes) else ""
-                    key = _text(first(f[4], 1, b"")) if isinstance(f.get(4), bytes) else ""
-                    pages[_text(f.get(2))] = (key, bg)
+                parsed = safe_fields(body)
+                if parsed is None:
+                    break
+                f = dict(parsed)
+                try:
+                    _event(kind, f, backgrounds, attachments, pages)
+                except (ValueError, TypeError, KeyError, IndexError, struct.error):
+                    pass
                 break                                       # one kind per record
         sizes = [(w, h) for _, _, w, h in backgrounds.values() if w and h]
         default = max(set(sizes), key=sizes.count) if sizes else (612.0, 792.0)
@@ -331,13 +367,34 @@ def _cubic(p0, c, p1):
     return c1, c2
 
 
+def _draw_stroke(page, s: Stroke):
+    import pymupdf
+    shape = page.new_shape()
+    if not s.segments:                                   # a dot
+        shape.draw_circle(pymupdf.Point(s.start[0], s.start[1]), max(s.start[2], 0.5))
+        shape.finish(color=s.color, fill=s.color, width=0,
+                     stroke_opacity=s.opacity, fill_opacity=s.opacity)
+    prev = s.start
+    for c, end in s.segments:
+        c1, c2 = _cubic(prev, c, end)
+        shape.draw_bezier(pymupdf.Point(prev[0], prev[1]), pymupdf.Point(*c1),
+                          pymupdf.Point(*c2), pymupdf.Point(end[0], end[1]))
+        width = max((prev[2] + end[2]), 0.3)              # half-widths → full width
+        shape.finish(color=s.color, width=width, closePath=False,
+                     lineCap=0 if s.highlighter else 1, lineJoin=1,
+                     stroke_opacity=s.opacity)
+        prev = end
+    shape.commit()
+
+
 def render(pages: list[Page], zip_path: str, out_pdf: str) -> dict:
-    """Draw the pages into out_pdf. Returns counts: pages, strokes, texts, skipped."""
+    """Draw the pages into out_pdf. Returns counts: pages, strokes, texts, skipped
+    (elements that couldn't be drawn) and erased (strokes you rubbed out — not drawn)."""
     import pymupdf
 
     doc = pymupdf.open()
     sources: dict[str, object] = {}
-    stats = {"pages": 0, "strokes": 0, "texts": 0, "skipped": 0}
+    stats = {"pages": 0, "strokes": 0, "texts": 0, "skipped": 0, "erased": 0}
     with zipfile.ZipFile(zip_path) as z:
         for p in pages:
             page = doc.new_page(width=p.width, height=p.height)
@@ -347,32 +404,27 @@ def render(pages: list[Page], zip_path: str, out_pdf: str) -> dict:
                 src = sources[p.pdf]
                 if 1 <= p.pdf_page <= src.page_count:
                     page.show_pdf_page(page.rect, src, p.pdf_page - 1)
-            for s in p.strokes:
-                shape = page.new_shape()
-                if not s.segments:                       # a dot
-                    shape.draw_circle(pymupdf.Point(s.start[0], s.start[1]), max(s.start[2], 0.5))
-                    shape.finish(color=s.color, fill=s.color, width=0,
-                                 stroke_opacity=s.opacity, fill_opacity=s.opacity)
-                prev = s.start
-                for c, end in s.segments:
-                    c1, c2 = _cubic(prev, c, end)
-                    shape.draw_bezier(pymupdf.Point(prev[0], prev[1]), pymupdf.Point(*c1),
-                                      pymupdf.Point(*c2), pymupdf.Point(end[0], end[1]))
-                    width = max((prev[2] + end[2]), 0.3)  # half-widths → full width
-                    shape.finish(color=s.color, width=width, closePath=False,
-                                 lineCap=0 if s.highlighter else 1, lineJoin=1,
-                                 stroke_opacity=s.opacity)
-                    prev = end
-                shape.commit()
+            drawn = texts = skipped = 0
+            for s in p.strokes:                          # one bad stroke never costs the page
+                try:
+                    _draw_stroke(page, s)
+                    drawn += 1
+                except Exception:
+                    skipped += 1
             for t in p.texts:                            # shrinks to fit, any Unicode
-                r, g, b = (round(c * 255) for c in t.color)
-                page.insert_htmlbox(pymupdf.Rect(*t.rect), html.escape(t.text).replace("\n", "<br>"),
-                                    css=f"* {{font-family: sans-serif; font-size: {t.size}px; "
-                                        f"color: rgb({r},{g},{b});}}")
+                try:
+                    r, g, b = (round(c * 255) for c in t.color)
+                    page.insert_htmlbox(pymupdf.Rect(*t.rect), html.escape(t.text).replace("\n", "<br>"),
+                                        css=f"* {{font-family: sans-serif; font-size: {t.size}px; "
+                                            f"color: rgb({r},{g},{b});}}")
+                    texts += 1
+                except Exception:
+                    skipped += 1
             stats["pages"] += 1
-            stats["strokes"] += len(p.strokes)
-            stats["texts"] += len(p.texts)
-            stats["skipped"] += p.skipped
+            stats["strokes"] += drawn
+            stats["texts"] += texts
+            stats["skipped"] += p.skipped + skipped
+            stats["erased"] += p.erased
     doc.save(out_pdf, garbage=3, deflate=True)
     doc.close()
     for src in sources.values():
